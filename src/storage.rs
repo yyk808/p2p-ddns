@@ -3,7 +3,7 @@ use iroh::{NodeId, PublicKey, SecretKey};
 use redb::{Database, ReadableTable, TableDefinition};
 use std::{fs::File, path::Path, str::FromStr, sync::Arc};
 
-use crate::{network::Node, utils::Args};
+use crate::{network::Node, utils::CliArgs};
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 const SECRERT: TableDefinition<&str, &str> = TableDefinition::new("secret");
@@ -13,6 +13,7 @@ pub struct Storage {
     db: Arc<Database>,
 }
 
+#[allow(dead_code)]
 impl Storage {
     pub fn new<P: AsRef<Path>>(file_path: P) -> Result<Self, redb::Error> {
         let db = Database::create(file_path)?;
@@ -35,7 +36,7 @@ impl Storage {
                 .into_iter()
                 .map(|t| {
                     let (_, v) = t.unwrap();
-                    postcard::from_bytes(v.value().as_ref()).unwrap()
+                    postcard::from_bytes(v.value()).unwrap()
                 })
                 .collect();
 
@@ -60,13 +61,18 @@ impl Storage {
         Ok(())
     }
 
-    pub fn batch_save_nodes(&self, nodes: Vec<Node>) -> Result<(), redb::Error> {
+    pub fn batch_save_nodes<I, T>(&self, node_iter: I) -> Result<(), redb::Error>
+    where
+        I: Iterator<Item = T>,
+        T: Into<Node>,
+    {
         let write_txn = self.db.begin_write()?;
 
         {
             let mut table = write_txn.open_table(TABLE)?;
 
-            for node in nodes {
+            for node in node_iter {
+                let node = node.into();
                 let key = node.node_id.to_string();
                 let val = postcard::to_allocvec(&node).unwrap();
                 let _ = table.insert(key.to_string().as_str(), val.as_slice())?;
@@ -134,9 +140,9 @@ impl TryFrom<File> for Storage {
     }
 }
 
-pub async fn init_storage(args: &Args) -> Result<Storage> {
-    let storage = Storage::new("running-context.db").unwrap();
-
+pub async fn init_storage(args: &CliArgs) -> Result<Storage> {
+    let db_path = crate::utils::default_storage_path(args);
+    let storage = Storage::new(db_path)?;
     Ok(storage)
 }
 
@@ -156,7 +162,7 @@ mod test {
             nodes.push(Node::random_node());
         }
 
-        storage.batch_save_nodes(nodes.clone()).unwrap();
+        storage.batch_save_nodes(nodes.clone().into_iter()).unwrap();
         let loaded_nodes = storage.load_nodes().unwrap();
 
         assert_eq!(nodes.len(), loaded_nodes.len());

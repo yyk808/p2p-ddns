@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    hash::{Hash, Hasher},
-    net::SocketAddr,
-    str::FromStr,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{collections::BTreeMap, hash::Hash, net::SocketAddr, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -13,7 +7,8 @@ use ed25519::Signature;
 use futures_lite::StreamExt;
 use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, SecretKey,
-    discovery::{DiscoveryItem, Lagged},
+    discovery::static_provider::StaticProvider,
+    node_info::{NodeData, NodeInfo, UserData},
     protocol::Router,
 };
 use iroh_gossip::{
@@ -25,11 +20,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     storage::Storage,
-    utils::{Args, Ticket},
+    utils::{CliArgs, Ticket},
 };
 
 #[derive(Debug, Serialize, Deserialize)]
-enum Message {
+pub enum Message {
     AboutMe {
         alias: String,
         services: BTreeMap<String, u32>,
@@ -103,6 +98,7 @@ pub struct Auth {
     pub timestamp: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Context {
     pub handle: Endpoint,
@@ -112,8 +108,8 @@ pub struct Context {
     pub topic: TopicId,
     pub nodes: DashMap<NodeId, Node>,
     pub me: Arc<Node>,
-    pub lag_happend: Arc<AtomicBool>,
     pub sender: GossipSender,
+    pub args: CliArgs,
     pub pending_auth: DashMap<NodeId, Auth>,
 }
 
@@ -145,112 +141,153 @@ impl PartialEq for Auth {
 
 impl Eq for Auth {}
 
-pub async fn init_network(args: &Args, storage: Storage) -> Result<(Context, GossipReceiver)> {
-    let sk = SecretKey::generate(rand::rngs::OsRng);
-    let pk = sk.public();
+pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, GossipReceiver)> {
+    let (pk, sk) = storage.load_secret()?.unwrap_or_else(|| {
+        let sk = SecretKey::generate(rand::rngs::OsRng);
+        let pk = sk.public();
+        storage.save_secret(sk.clone()).unwrap();
+        (pk, sk)
+    });
+
+    let nodes = storage.load_nodes()?;
+    let sp = StaticProvider::new();
+    nodes.iter().for_each(|node| {
+        let info = NodeInfo {
+            node_id: node.node_id,
+            data: NodeData::from(node.addr.clone()),
+        };
+        sp.add_node_info(info);
+    });
 
     // TODO: distinguish daemon and client mode
     // TODO: dynamic ALPN name
     let endpoint = Endpoint::builder()
         .relay_mode(iroh::RelayMode::Disabled)
         .secret_key(sk)
+        .add_discovery(|_| Some(sp))
         .discovery_local_network()
         .discovery_dht()
         .bind()
         .await?;
 
-    let nodes = storage.load_nodes()?;
-    nodes.iter().for_each(|node| {
-        endpoint.add_node_addr(NodeAddr::from(node.addr.clone()));
-    });
+    let me = endpoint.node_addr().await?;
+    endpoint.set_user_data_for_discovery(
+        args.alias
+            .clone()
+            .map(|alias| UserData::from_str(alias.as_str()).unwrap()),
+    );
 
     let ticket = if args.primary {
         let topic = TopicId::from_bytes(rand::random());
         let rnum = rand::random::<[u8; 32]>().to_vec();
-        let me = endpoint.node_addr().await?;
         Ticket {
             topic,
             rnum,
-            addr: me,
+            addr: me.clone(),
         }
     } else {
         Ticket::from_str(&args.ticket.clone().unwrap())?
     };
 
+    let me = Node {
+        node_id: pk,
+        invitor: ticket.addr.node_id,
+        addr: me,
+        alias: args.alias.clone().unwrap_or_else(|| "Unknown".to_string()),
+        services: Default::default(),
+        last_heartbeat: 0,
+    };
+
     let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
-    let router = Router::builder(endpoint)
+    let router = Router::builder(endpoint.clone())
         .accept(ALPN, gossip.clone())
         .spawn()
         .await?;
 
-    let bootstrap = nodes.iter().map(|node| node.addr.node_id.clone()).collect();
+    let bootstrap = nodes.iter().map(|node| node.addr.node_id).collect();
     let (sender, receiver) = gossip
         .subscribe_and_join(ticket.topic, bootstrap)
         .await?
         .split();
 
-    let context = todo!();
+    let context = Context {
+        handle: endpoint,
+        storage,
+        router,
+        gossip,
+        topic: ticket.topic,
+        nodes: DashMap::new(),
+        me: Arc::new(me),
+        sender,
+        args,
+        pending_auth: DashMap::new(),
+    };
 
-    Ok(context)
+    Ok((context, receiver))
 }
 
 impl Context {
-    pub async fn run(&self, mut receiver: GossipReceiver) -> Result<()> {
-        let mut discovery_stream = self.handle.discovery_stream();
-        let conn = self.handle.accept().await;
+    pub async fn run(&self, mut receiver: GossipReceiver) {
+        let mut cron_jobs = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
+                    log::info!("Shutting down...");
+                    self.graceful_shutdown().await;
                     break;
+                },
+                _ = cron_jobs.tick() => {
+                    let _ = self.broadcast_message(Message::Heartbeat).await;
+                    self.cleanup().await;
                 },
                 evt = receiver.try_next() => {
                     self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
-
-                }
-                item = discovery_stream.next() => {
-                    self.process_discovery(item).await;
-                },
-                Some(incoming) = self.handle.accept() => {
-                    let connecting = match incoming.accept() {
-                        Ok(connecting) => connecting,
-                        Err(err) => {
-                            log::warn!("incoming connection failed: {err:#}");
-                            // we can carry on in these cases:
-                            // this can be caused by retransmitted datagrams
-                            continue;
-                        }
-                    };
-                    let connection = connecting.await?;
-
                 }
             }
         }
+    }
 
-        self.router.shutdown().await
+    pub async fn graceful_shutdown(&self) {
+        let me = self.me.clone();
+        let _ = self.broadcast_message(Message::Left).await;
+        self.nodes.remove(&me.node_id);
+
+        log::info!("Saving {} nodes to storage", self.nodes.len());
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|it| it.value().clone())
+            .collect::<Vec<_>>();
+        self.storage
+            .batch_save_nodes(nodes.into_iter())
+            .expect("Failed to save nodes while shutting down");
+    }
+
+    pub async fn cleanup(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.pending_auth
+            .retain(|_, auth| now - auth.timestamp < 60 * 5);
     }
 
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
         match evt {
             Ok(Some(evt)) => match evt {
                 Event::Gossip(gossip_event) => match gossip_event {
-                    GossipEvent::Joined(items) => todo!(),
-                    GossipEvent::NeighborUp(public_key) => todo!(),
-                    GossipEvent::NeighborDown(public_key) => todo!(),
+                    GossipEvent::NeighborDown(public_key) => {
+                        self.nodes.remove(&public_key);
+                        self.pending_auth.remove(&public_key);
+                    }
                     GossipEvent::Received(message) => self.process_message(message).await,
+                    _ => {}
                 },
-                Event::Lagged => {
-                    self.lag_happend
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
+                Event::Lagged => log::warn!("Gossip network is lagged"),
             },
             Err(e) => log::error!("Error processing gossip event: {:?}", e),
             _ => {}
-        }
-    }
-
-    async fn process_discovery(&self, item: Option<Result<DiscoveryItem, Lagged>>) {
-        if let Some(Ok(addr)) = item {
-            todo!()
         }
     }
 
@@ -386,14 +423,16 @@ impl Context {
                     }
                 }
                 Message::SyncRequest { nodes } => {
-                    nodes.iter().for_each(|node| {
-                        let target = self.nodes.get(&node.node_id);
-                        if target
-                            .is_some_and(|inner| inner.last_heartbeat + 60 < node.last_heartbeat)
-                        {
-                            self.nodes.insert(node.node_id, node.clone());
-                        }
-                    });
+                    if passed {
+                        nodes.iter().for_each(|node| {
+                            let target = self.nodes.get(&node.node_id);
+                            if target.is_some_and(|inner| {
+                                inner.last_heartbeat + 60 < node.last_heartbeat
+                            }) {
+                                self.nodes.insert(node.node_id, node.clone());
+                            }
+                        });
+                    }
 
                     let nodes = self
                         .nodes
@@ -405,13 +444,16 @@ impl Context {
                     self.send_message_to(&id, message).await.unwrap();
                 }
                 Message::SyncResponse { nodes } => {
-                    nodes.iter().for_each(|node| {
-                        let target = self.nodes.get(&node.node_id);
-                        if target.is_none() || target.unwrap().last_heartbeat < node.last_heartbeat
-                        {
-                            self.nodes.insert(node.node_id, node.clone());
-                        }
-                    });
+                    if self.args.running_mode.client || (self.args.running_mode.daemon && passed) {
+                        nodes.iter().for_each(|node| {
+                            let target = self.nodes.get(&node.node_id);
+                            if target.is_none()
+                                || target.unwrap().last_heartbeat < node.last_heartbeat
+                            {
+                                self.nodes.insert(node.node_id, node.clone());
+                            }
+                        });
+                    }
                 }
 
                 #[allow(unreachable_patterns)]
@@ -426,6 +468,7 @@ impl Context {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn broadcast_neighbor_message(&self, message: Message) -> Result<()> {
         let bm = SignedMessage::sign_and_encode(self.handle.secret_key(), message)?;
         self.sender.broadcast_neighbors(bm).await?;
@@ -477,8 +520,160 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_network() {
-        todo!()
-    }
+    // #[test]
+    // fn test_signed_message_decode_and_verify() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试消息
+    //     let message = Message::AboutMe {
+    //         alias: "Test Alias".to_string(),
+    //         services: BTreeMap::new(),
+    //         invitor: NodeId::default(),
+    //     };
+
+    //     // 对消息进行签名和编码
+    //     let encoded_message =
+    //         SignedMessage::sign_and_encode(&ctx.handle.secret_key(), message).unwrap();
+
+    //     // 解码并验证消息
+    //     let (decoded_key, decoded_message, pass) =
+    //         SignedMessage::decode_and_verify(ctx, &encoded_message).unwrap();
+
+    //     // 验证解码结果
+    //     assert_eq!(decoded_message, message);
+    //     assert!(pass);
+    // }
+
+    // #[test]
+    // fn test_signed_message_sign_and_encode() {
+    //     // 创建测试消息
+    //     let message = Message::AboutMe {
+    //         alias: "Test Alias".to_string(),
+    //         services: BTreeMap::new(),
+    //         invitor: NodeId::default(),
+    //     };
+
+    //     // 对消息进行签名和编码
+    //     let encoded_message =
+    //         SignedMessage::sign_and_encode(&ctx.handle.secret_key(), message).unwrap();
+
+    //     // 验证编码结果
+    //     assert!(!encoded_message.is_empty());
+    // }
+
+    // #[test]
+    // fn test_init_network() {
+    //     // 创建测试参数
+    //     let args = Args::default();
+
+    //     // 创建测试存储
+    //     let storage = Storage::default();
+
+    //     // 初始化网络
+    //     let (context, receiver) = init_network(&args, storage).unwrap();
+
+    //     // 验证上下文和接收者是否创建成功
+    //     assert!(context.handle.is_bound());
+    //     assert!(receiver.is_some());
+    // }
+
+    // #[test]
+    // fn test_context_run() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试接收者
+    //     let mut receiver = GossipReceiver::default();
+
+    //     // 运行上下文
+    //     ctx.run(receiver).await.unwrap();
+    // }
+
+    // #[test]
+    // fn test_context_process_gossip() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试事件
+    //     let event = Event::Gossip(GossipEvent::Received(IrohMessage::default()));
+
+    //     // 处理事件
+    //     ctx.process_gossip(Ok(Some(event))).await;
+    // }
+
+    // #[test]
+    // fn test_context_process_discovery() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试发现项
+    //     let item = Some(Ok(DiscoveryItem::default()));
+
+    //     // 处理发现项
+    //     ctx.process_discovery(item).await;
+    // }
+
+    // #[test]
+    // fn test_context_process_message() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试消息
+    //     let message = IrohMessage::default();
+
+    //     // 处理消息
+    //     ctx.process_message(message).await;
+    // }
+
+    // #[test]
+    // fn test_context_broadcast_message() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试消息
+    //     let message = Message::AboutMe {
+    //         alias: "Test Alias".to_string(),
+    //         services: BTreeMap::new(),
+    //         invitor: NodeId::default(),
+    //     };
+
+    //     // 广播消息
+    //     ctx.broadcast_message(message).await.unwrap();
+    // }
+
+    // #[test]
+    // fn test_context_broadcast_neighbor_message() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试消息
+    //     let message = Message::AboutMe {
+    //         alias: "Test Alias".to_string(),
+    //         services: BTreeMap::new(),
+    //         invitor: NodeId::default(),
+    //     };
+
+    //     // 广播邻居消息
+    //     ctx.broadcast_neighbor_message(message).await.unwrap();
+    // }
+
+    // #[test]
+    // fn test_context_send_message_to() {
+    //     // 创建测试上下文
+    //     let ctx = Context::default();
+
+    //     // 创建测试节点 ID
+    //     let id = NodeId::default();
+
+    //     // 创建测试消息
+    //     let message = Message::AboutMe {
+    //         alias: "Test Alias".to_string(),
+    //         services: BTreeMap::new(),
+    //         invitor: NodeId::default(),
+    //     };
+
+    //     // 发送消息
+    //     ctx.send_message_to(&id, message).await.unwrap();
+    // }
 }

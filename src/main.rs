@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
+use network::init_network;
 use storage::init_storage;
-use utils::Args;
+use utils::CliArgs;
 
 mod host;
 mod network;
@@ -10,11 +11,12 @@ mod utils;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    Args::validate(&args)?;
+    let args = CliArgs::parse();
+    CliArgs::validate(&args)?;
 
     let storage = init_storage(&args).await?;
-    let (ctx, receiver) = network::init_network(&args, storage).await?;
+    let (ctx, receiver) = init_network(args, storage).await?;
 
-    ctx.run(receiver).await
+    ctx.run(receiver).await;
+    Ok(())
 }
