@@ -1,9 +1,9 @@
 use core::fmt;
 use std::str::FromStr;
 
-use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-use clap::Parser;
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+use clap::Parser;
 use iroh::NodeAddr;
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};

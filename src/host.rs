@@ -260,7 +260,7 @@ impl HostsBuilder {
                 }
 
                 begin
-            },
+            }
             (None, None) => {
                 // Insert a blank line before a new section.
                 if let Some(last_line) = lines.iter().last() {
@@ -269,13 +269,13 @@ impl HostsBuilder {
                     }
                 }
                 lines.len()
-            },
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("start or end marker missing in {:?}", &hosts_path),
                 ));
-            },
+            }
         };
 
         let mut s = vec![];
@@ -297,10 +297,10 @@ impl HostsBuilder {
             Err(_) => {
                 Self::write_clobber(hosts_path, &s)?;
                 log::debug!("wrote hosts file with the clobber fallback strategy");
-            },
+            }
             _ => {
                 log::debug!("wrote hosts file with the write-and-swap strategy");
-            },
+            }
         };
 
         Ok(true)
@@ -337,12 +337,14 @@ mod tests {
         let hosts_path = Path::new("/etc/hosts");
         let temp_path = HostsBuilder::get_temp_path(hosts_path).unwrap();
         println!("{temp_path:?}");
-        assert!(temp_path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("hosts.tmp"));
+        assert!(
+            temp_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("hosts.tmp")
+        );
     }
 
     #[test]

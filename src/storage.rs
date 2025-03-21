@@ -1,7 +1,6 @@
-use iroh::{node_info::NodeIdExt, NodeId, PublicKey, SecretKey};
-use redb::{Database, ReadableTable, TableDefinition};
-use serde_json;
 use anyhow::Result;
+use iroh::{NodeId, PublicKey, SecretKey};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::{fs::File, path::Path, str::FromStr, sync::Arc};
 
 use crate::{network::Node, utils::Args};
@@ -32,17 +31,19 @@ impl Storage {
         let first_entry = table.first().unwrap();
         if let Some(first) = first_entry {
             let range = table.range(first.0.value()..).unwrap();
-            let nodes = range.into_iter().map(|t| {
-                let (_, v) = t.unwrap();
-                postcard::from_bytes(v.value().as_ref()).unwrap()
-            }).collect();
+            let nodes = range
+                .into_iter()
+                .map(|t| {
+                    let (_, v) = t.unwrap();
+                    postcard::from_bytes(v.value().as_ref()).unwrap()
+                })
+                .collect();
 
             Ok(nodes)
         } else {
             Ok(vec![])
         }
     }
-
 
     pub fn save_node(&self, node: &Node) -> Result<(), redb::Error> {
         let write_txn = self.db.begin_write()?;
@@ -58,7 +59,6 @@ impl Storage {
         write_txn.commit()?;
         Ok(())
     }
-
 
     pub fn batch_save_nodes(&self, nodes: Vec<Node>) -> Result<(), redb::Error> {
         let write_txn = self.db.begin_write()?;
@@ -76,7 +76,6 @@ impl Storage {
         write_txn.commit()?;
         Ok(())
     }
-
 
     pub fn remove_node(&self, peer_id: &NodeId) -> Result<(), redb::Error> {
         let write_txn = self.db.begin_write()?;
