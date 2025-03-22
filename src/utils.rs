@@ -102,6 +102,9 @@ impl Ticket {
 
 impl fmt::Display for Ticket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        #[cfg(debug_assertions)]
+        log::debug!("Displaying Ticket: {:?}", self.inner);
+
         let inner = self.inner.read();
         let text = postcard::to_stdvec(&*inner).unwrap();
         let text = STANDARD_NO_PAD.encode(text);
@@ -115,6 +118,10 @@ impl FromStr for Ticket {
         let bytes = STANDARD_NO_PAD.decode(s)?;
         let inner: Result<TicketInner> =
             postcard::from_bytes(&bytes).map_err(|e| anyhow::anyhow!(e));
+
+        #[cfg(debug_assertions)]
+        log::debug!("Loaded Ticket from str: {:?}", inner);
+
         inner.map(|inner| Self {
             inner: Arc::new(RwLock::new(inner)),
         })
@@ -178,15 +185,13 @@ impl CliArgs {
         {
             anyhow::bail!("alias length should be less than {}", UserData::MAX_LENGTH);
         }
+
         Ok(())
     }
 
     pub fn apply(&self) {
         env_logger::Builder::new()
-            .filter_module("iroh", log::LevelFilter::Off)
-            .filter_module("iroh_gossip", log::LevelFilter::Off)
-            .filter_module("tracing::span", log::LevelFilter::Off)
-            .filter_level(self.log.into())
+            .filter(Some("p2p_ddns2"), self.log.into())
             .init();
     }
 }

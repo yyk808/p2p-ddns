@@ -8,9 +8,10 @@ use futures_lite::StreamExt;
 use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, SecretKey,
     discovery::{
-        ConcurrentDiscovery, local_swarm_discovery::LocalSwarmDiscovery,
+        ConcurrentDiscovery, DiscoveryItem, local_swarm_discovery::LocalSwarmDiscovery,
         static_provider::StaticProvider,
     },
+    endpoint::RecvStream,
     node_info::{NodeData, NodeInfo, UserData},
     protocol::Router,
 };
@@ -28,8 +29,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     storage::Storage,
-    utils::{CliArgs, Ticket},
+    utils::{CliArgs, Ticket, output},
 };
+
+pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
+pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
@@ -175,6 +179,13 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
 
     let mut discoveries = ConcurrentDiscovery::empty();
     let sp = StaticProvider::new();
+    discoveries.add(sp.clone());
+
+    if args.daemon {
+        let local_discovery = LocalSwarmDiscovery::new(pk).unwrap();
+        discoveries.add(local_discovery);
+    }
+
     if let Ok(addr) = invitor_addr {
         sp.add_node_info(NodeInfo::from_parts(addr.node_id, NodeData::from(addr)));
     }
@@ -185,12 +196,6 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         };
         sp.add_node_info(info);
     });
-    discoveries.add(sp);
-
-    if args.daemon {
-        let local_discovery = LocalSwarmDiscovery::new(pk).unwrap();
-        discoveries.add(local_discovery);
-    }
 
     // TODO: dynamic ALPN name
     // endpoint-protocol(gossip)-router are iroh components
@@ -198,6 +203,7 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         .relay_mode(iroh::RelayMode::Disabled)
         .secret_key(sk)
         .add_discovery(|_| Some(discoveries))
+        .alpns([ALPN.into()].into())
         .bind()
         .await?;
     let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
@@ -206,6 +212,7 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         .spawn()
         .await?;
     let me = endpoint.node_addr().await?;
+    log::debug!("My node address: {:?}", me);
 
     // Generate a ticket for ourself.
     let ticket = match arg_ticket {
@@ -213,7 +220,18 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         Err(_) => Ticket::new(None, me.clone()),
     };
 
-    let bootstrap = nodes.iter().map(|node| node.addr.node_id).collect();
+    let bootstrap = nodes
+        .iter()
+        .map(|node| node.addr.node_id)
+        .chain([invitor])
+        .collect();
+    let bootstrap_nodes: DashMap<NodeId, Node> =
+        nodes.into_iter().map(|node| (node.node_id, node)).collect();
+    if !args.primary && bootstrap_nodes.is_empty() {
+        return Err(anyhow::anyhow!("No bootstrap nodes found"));
+    } else {
+        log::debug!("Bootstrap nodes: {:?}", bootstrap);
+    }
 
     let (sender, receiver) = if args.primary {
         gossip.subscribe(ticket.topic(), bootstrap)?.split()
@@ -255,7 +273,7 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         router,
         gossip,
         ticket,
-        nodes: DashMap::new(),
+        nodes: bootstrap_nodes,
         me: Arc::new(me),
         sender,
         args,
@@ -268,6 +286,7 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
 impl Context {
     pub async fn run(&self, mut receiver: GossipReceiver) {
         let mut cron_jobs = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut discovery = self.handle.discovery_stream();
 
         // before join the loop, we still need to broadcast some message to bootstrap ourself.
         if self.args.daemon {
@@ -297,15 +316,33 @@ impl Context {
                 _ = cron_jobs.tick() => {
                     if self.args.daemon {
                         let _ = self.broadcast_message(Message::Heartbeat).await;
+                        self.update_nodes().await;
+                    } else {
+                        output(self.clone());
                     }
 
                     self.cleanup().await;
-                    self.update_nodes().await;
                     if let Err(e) = self.save().await {
                         log::error!("Failed to save nodes to storage: {:?}", e);
                     }
                 },
+                item = discovery.try_next() => {
+                    log::debug!("Received discovery item: {:?}", item);
+                    self.process_discovery(item.map_err(|lag| anyhow::anyhow!("Lagging discovery: {}", lag))).await;
+                },
+                Some(incoming) = self.handle.accept() => {
+                    log::debug!("Incoming connection: {:?}", incoming);
+                    let connection = match incoming.accept() {
+                        Ok(connecting) => connecting.await,
+                        _ => continue,
+                    };
+                    if let Ok(connection) = connection {
+                        let (_, mut rx) = connection.open_bi().await.unwrap();
+                        self.process_conn(&mut rx).await;
+                    }
+                },
                 evt = receiver.try_next() => {
+                    log::debug!("Received event: {:?}", evt);
                     self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
                 }
             }
@@ -313,7 +350,10 @@ impl Context {
     }
 
     pub async fn graceful_shutdown(&self) {
-        let _ = self.broadcast_message(Message::Left).await;
+        if self.args.daemon {
+            let _ = self.broadcast_message(Message::Left).await;
+        }
+
         let _ = self.save().await;
         let _ = self.router.shutdown().await;
         self.handle.close().await;
@@ -322,7 +362,7 @@ impl Context {
     pub async fn save(&self) -> Result<()> {
         self.nodes.remove(&self.me.node_id);
 
-        log::info!("Saving {} nodes to storage", self.nodes.len());
+        log::debug!("Saving {} nodes to storage", self.nodes.len());
         let nodes = self
             .nodes
             .iter()
@@ -408,12 +448,16 @@ impl Context {
             .await;
     }
 
+    async fn process_discovery(&self, _item: Result<Option<DiscoveryItem>>) {}
+
+    async fn process_conn(&self, rx: &mut RecvStream) {}
+
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
         match evt {
             Ok(Some(evt)) => match evt {
                 Event::Gossip(gossip_event) => match gossip_event {
                     GossipEvent::NeighborDown(public_key) => {
-                        self.nodes.remove(&public_key);
+                        // self.nodes.remove(&public_key);
                         self.pending_auth.remove(&public_key);
                     }
                     GossipEvent::Received(message) => self.process_message(message).await,
@@ -570,14 +614,20 @@ impl Context {
                         });
                     }
 
-                    let nodes = self
-                        .nodes
-                        .iter()
-                        .map(|t| t.value().clone())
-                        .collect::<Vec<_>>();
+                    if self.args.daemon {
+                        let nodes = self
+                            .nodes
+                            .iter()
+                            .map(|t| t.value().clone())
+                            .chain([self.me.as_ref().clone()])
+                            .collect::<Vec<_>>();
 
-                    let message = Message::SyncResponse { nodes };
-                    self.send_message_to(&id, message).await.unwrap();
+                        let message = Message::SyncResponse { nodes };
+                        // self.send_message_to(&id, message).await.unwrap();
+                        if let Err(e) = self.broadcast_neighbor_message(message).await {
+                            log::error!("Failed to send SyncResponse to {:?}: {:?}", id, e);
+                        }
+                    }
                 }
                 Message::SyncResponse { nodes } => {
                     // A message from a trusted node is always valid.
@@ -601,6 +651,7 @@ impl Context {
     }
 
     pub async fn broadcast_message(&self, message: Message) -> Result<()> {
+        log::debug!("Broadcasting message: {:?}", message);
         let bm = SignedMessage::sign_and_encode(self.handle.secret_key(), message)?;
         self.sender.broadcast(bm).await?;
         Ok(())
@@ -608,6 +659,7 @@ impl Context {
 
     #[allow(dead_code)]
     pub async fn broadcast_neighbor_message(&self, message: Message) -> Result<()> {
+        log::debug!("Broadcasting neighbor message: {:?}", message);
         let bm = SignedMessage::sign_and_encode(self.handle.secret_key(), message)?;
         self.sender.broadcast_neighbors(bm).await?;
         Ok(())
@@ -618,6 +670,7 @@ impl Context {
             return Ok(());
         }
 
+        log::debug!("Sending message to {:?}: {:?}", id, message);
         if let Some(info) = self.handle.remote_info(*id) {
             let addr = NodeAddr::from(info);
             match self.handle.connect(addr, ALPN).await {

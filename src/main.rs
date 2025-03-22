@@ -6,6 +6,7 @@ use utils::{environment_detection, CliArgs};
 
 mod host;
 mod network;
+mod protocol;
 mod storage;
 mod utils;
 
