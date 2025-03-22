@@ -173,6 +173,11 @@ pub async fn init_network(
     args: CliArgs,
     storage: Storage,
 ) -> Result<(Context, GossipReceiver, Receiver<Bytes>, Option<Vec<u8>>)> {
+    // When creating a new network, un-trust all nodes and clear cache.
+    if args.primary {
+        storage.clear()?;
+    }
+
     let nodes = storage.load_nodes()?;
 
     // Try to load the secret key from storage, if not found, generate a new one.
@@ -248,14 +253,16 @@ pub async fn init_network(
         Ticket::new(None, me.clone())
     };
 
-    let bootstrap = nodes
+    let bootstrap: Vec<_> = nodes
         .iter()
         .map(|node| node.addr.node_id)
         .chain(invitor)
         .collect();
-    let bootstrap_nodes: DashMap<NodeId, Node> =
-        nodes.into_iter().map(|node| (node.node_id, node)).chain(invitor_node.map(|node| (node.node_id, node))).collect();
-    if !args.primary && bootstrap_nodes.is_empty() {
+    let bootstrap_nodes: DashMap<NodeId, Node> = nodes
+        .into_iter()
+        .map(|node| (node.node_id, node))
+        .collect();
+    if !args.primary && bootstrap.is_empty() {
         return Err(anyhow::anyhow!("No bootstrap nodes found"));
     } else {
         log::debug!("Bootstrap nodes: {:?}", bootstrap);
@@ -271,7 +278,11 @@ pub async fn init_network(
         .await
         {
             Ok(Ok(res)) => res.split(),
-            _ => return Err(anyhow::anyhow!("Timeout join gossip, please check your ticket")),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Timeout join gossip, please check your ticket"
+                ));
+            }
         }
     };
 
@@ -387,7 +398,6 @@ impl Context {
                     }
                 },
                 evt = gos_recv.try_next() => {
-                    log::debug!("Received event: {:?}", evt);
                     self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
                 }
             }
@@ -444,14 +454,22 @@ impl Context {
                 .or_insert((node.node_id, node.last_heartbeat));
         }
 
-        // Remove nodes that have the same alias but aren't the most recent
-        for pair in self.nodes.iter() {
-            let node = pair.value();
-            if let Some((best_id, _)) = by_alias.get(&node.alias) {
-                if *best_id != node.node_id {
-                    self.nodes.remove(&node.node_id);
+        let nodes_to_remove = {
+            let mut to_remove = Vec::new();
+            for pair in self.nodes.iter() {
+                let node = pair.value();
+                if let Some((best_id, _)) = by_alias.get(&node.alias) {
+                    if *best_id != node.node_id {
+                        to_remove.push(node.node_id);
+                    }
                 }
             }
+            to_remove
+        };
+
+        // Remove nodes that have the same alias but aren't the most recent
+        for node_id in nodes_to_remove {
+            self.nodes.remove(&node_id);
         }
     }
 
@@ -487,6 +505,7 @@ impl Context {
             .nodes
             .iter()
             .map(|it| it.value().clone())
+            .chain([self.me.as_ref().clone()])
             .collect::<Vec<_>>();
         let _ = self
             .broadcast_neighbor_message(Message::SyncRequest { nodes })
@@ -523,6 +542,16 @@ impl Context {
         log::debug!("Received message from {:?}", from);
         log::debug!("Message: {:?}", message);
 
+        if passed {
+            self.nodes.alter(&from, |_, mut node| {
+                node.last_heartbeat = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                node
+            });
+        }
+
         match message {
             Message::Invited {
                 topic,
@@ -533,6 +562,8 @@ impl Context {
                 if !self.ticket.validate(topic, rnum) {
                     log::error!("Received untrusted Invited message from {:?}", from);
                     return;
+                } else {
+                    log::info!("Trusting node: {:?} for it holds our ticket", from);
                 }
 
                 let addr = if let Some(info) = self.handle.remote_info(from) {
@@ -666,36 +697,25 @@ impl Context {
                     self.pending_auth.insert(invited, auth);
                 }
             }
-            Message::Heartbeat => {
-                if !passed {
-                    log::error!("Received untrusted Heartbeat message from {:?}", from);
-                    return;
-                }
-
-                if let Some(mut node) = self.nodes.get_mut(&from) {
-                    node.last_heartbeat = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                }
-            }
+            Message::Heartbeat => {}
             Message::Left => {
                 if !passed {
                     log::error!("Received untrusted Left message from {:?}", from);
                     return;
                 }
-
-                // if let Some((id, _)) = self.nodes.remove(&from) {
-                //     log::info!("Node {} left the chat", id);
-                // }
             }
             Message::SyncRequest { nodes } => {
-                if passed {
+                if !self.args.daemon || (self.args.daemon && passed) {
                     nodes.iter().for_each(|node| {
-                        let target = self.nodes.get(&node.node_id);
-                        if target
-                            .is_some_and(|inner| inner.last_heartbeat + 60 < node.last_heartbeat)
-                        {
+                        let should_update = {
+                            let target = self.nodes.get(&node.node_id);
+                            target.is_none()
+                                || target
+                                    .as_ref()
+                                    .map_or(false, |t| t.last_heartbeat < node.last_heartbeat)
+                        };
+                        if should_update {
+                            log::debug!("Updating node: {:?}", node);
                             self.nodes.insert(node.node_id, node.clone());
                         }
                     });
@@ -720,9 +740,15 @@ impl Context {
                 // Or if we are a client, we simply trust everything.
                 if !self.args.daemon || (self.args.daemon && passed) {
                     nodes.iter().for_each(|node| {
-                        let target = self.nodes.get(&node.node_id);
-                        if target.is_none() || target.unwrap().last_heartbeat < node.last_heartbeat
-                        {
+                        let should_update = {
+                            let target = self.nodes.get(&node.node_id);
+                            target.is_none()
+                                || target
+                                    .as_ref()
+                                    .map_or(false, |t| t.last_heartbeat < node.last_heartbeat)
+                        };
+                        if should_update {
+                            log::debug!("Updating node: {:?}", node);
                             self.nodes.insert(node.node_id, node.clone());
                         }
                     });
@@ -741,7 +767,6 @@ impl Context {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn broadcast_neighbor_message(&self, message: Message) -> Result<()> {
         log::debug!("Broadcasting neighbor message: {:?}", message);
         let bm = SignedMessage::sign_and_encode(self.handle.secret_key(), message)?;

@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
 
     match init_network(args, storage).await {
         Ok((ctx, gos_recv, sp_recv, rnum)) => {
-            println!("Ticket: {}", ctx.ticket);
+            log::info!("Ticket: {}", ctx.ticket);
             ctx.run(gos_recv, sp_recv, rnum).await;
         },
         Err(e) => {

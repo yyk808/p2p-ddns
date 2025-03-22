@@ -70,6 +70,11 @@ pub struct CliArgs {
             .map(|s| s.parse::<LogLevel>().unwrap()),
     )]
     log: LogLevel,
+
+    /// For debug convinience
+    #[cfg(debug_assertions)]
+    #[arg(long)]
+    pub debug: bool,
 }
 
 impl Ticket {
@@ -271,5 +276,5 @@ pub(crate) fn default_config_path(args: &CliArgs) -> PathBuf {
 }
 
 pub fn output(ctx: Context) {
-    println!("{:?}", ctx.nodes);
+    log::info!("{:?}", ctx.nodes);
 }

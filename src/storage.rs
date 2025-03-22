@@ -181,6 +181,17 @@ impl Storage {
         write_txn.commit()?;
         Ok(())
     }
+
+    pub fn clear(&self) -> Result<(), redb::Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            write_txn.delete_table(TABLE)?;
+            write_txn.delete_table(SECRERT)?;
+            write_txn.delete_table(CONFIG)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
 }
 
 impl TryFrom<File> for Storage {

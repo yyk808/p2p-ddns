@@ -64,6 +64,7 @@ impl ProtocolHandler for P2Protocol {
     ) -> futures_lite::future::Boxed<anyhow::Result<()>> {
         let proto = self.clone();
         Box::pin(async move {
+            log::debug!("Accepting connection in p2p protocol");
             proto.handle_connection(conn).await?;
             Ok(())
         })
