@@ -58,7 +58,7 @@ pub struct CliArgs {
     pub ticket: Option<String>,
 
     /// Manually specify the path of the database file
-    #[arg(short, value_name = "CONFIG_PATH", value_hint = clap::ValueHint::DirPath)]
+    #[arg(short, long , value_name = "CONFIG_PATH", value_hint = clap::ValueHint::DirPath)]
     pub config: Option<std::path::PathBuf>,
 
     /// Log level, default is info
@@ -91,6 +91,11 @@ impl Ticket {
 
     pub fn load_addr(&self) -> NodeAddr {
         self.inner.read().addr.clone()
+    }
+
+    pub fn flatten(&self) -> (TopicId, Vec<u8>, NodeAddr) {
+        let inner = self.inner.read();
+        (inner.topic, inner.rnum.clone(), inner.addr.clone())
     }
 
     pub fn refresh(&self, ctx: Context) {

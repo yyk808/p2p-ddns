@@ -1,4 +1,7 @@
-use std::{cmp::max, collections::BTreeMap, hash::Hash, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    cmp::max, collections::BTreeMap, hash::Hash, net::SocketAddr, str::FromStr, sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -26,10 +29,12 @@ use rand::{
     thread_rng,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::Receiver;
 
 use crate::{
+    protocol::P2Protocol,
     storage::Storage,
-    utils::{CliArgs, Ticket, output},
+    utils::{CliArgs, Ticket, TicketInner, output},
 };
 
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
@@ -37,10 +42,19 @@ pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
+    Invited {
+        topic: TopicId,
+        rnum: Vec<u8>,
+        alias: String,
+        services: BTreeMap<String, u32>,
+    },
     AboutMe {
         alias: String,
         services: BTreeMap<String, u32>,
         invitor: NodeId,
+    },
+    Introduce {
+        invited: NodeId,
     },
     SyncRequest {
         nodes: Vec<Node>,
@@ -48,15 +62,12 @@ pub enum Message {
     SyncResponse {
         nodes: Vec<Node>,
     },
-    Introduce {
-        invited: NodeId,
-    },
     Heartbeat,
     Left,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SignedMessage {
+pub(crate) struct SignedMessage {
     from: NodeId,
     data: Bytes,
     signature: Signature,
@@ -64,8 +75,8 @@ struct SignedMessage {
 }
 
 impl SignedMessage {
-    pub fn decode_and_verify(ctx: Context, bytes: &[u8]) -> Result<(PublicKey, Message, bool)> {
-        let signed_message: Self = postcard::from_bytes(bytes)?;
+    pub fn decode_and_verify(ctx: Context, bytes: Bytes) -> Result<(PublicKey, Message, bool)> {
+        let signed_message: Self = postcard::from_bytes(bytes.as_ref())?;
         let key: PublicKey = signed_message.from;
 
         key.verify(&signed_message.data, &signed_message.signature)?;
@@ -121,6 +132,7 @@ pub struct Context {
     pub storage: Storage,
     pub router: Router,
     pub gossip: Gossip,
+    pub single_point: P2Protocol,
     pub ticket: Ticket,
     pub nodes: DashMap<NodeId, Node>,
     pub me: Arc<Node>,
@@ -157,7 +169,10 @@ impl PartialEq for Auth {
 
 impl Eq for Auth {}
 
-pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, GossipReceiver)> {
+pub async fn init_network(
+    args: CliArgs,
+    storage: Storage,
+) -> Result<(Context, GossipReceiver, Receiver<Bytes>, Option<Vec<u8>>)> {
     let nodes = storage.load_nodes()?;
 
     // Try to load the secret key from storage, if not found, generate a new one.
@@ -171,11 +186,19 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
 
     // Set up bootstrap nodes with ticket and storage
     let arg_ticket = Ticket::from_str(args.ticket.as_deref().unwrap_or("".into()));
-    let invitor_addr = arg_ticket.as_ref().map(|t| t.load_addr());
-    let invitor = match invitor_addr.as_ref() {
-        Ok(addr) => addr.node_id,
-        Err(_) => pk.clone(),
-    };
+    let arg_ticket = arg_ticket.map(|t| t.flatten());
+    let has_ticket = arg_ticket.is_ok();
+    let (invitor, invitor_addr, invitor_rnum, topic) = arg_ticket
+        .map(|(topic, rnum, addr)| (Some(addr.node_id), Some(addr), Some(rnum), Some(topic)))
+        .unwrap_or((None, None, None, None));
+    let invitor_node = invitor.map(|id| Node {
+        node_id: id,
+        invitor: id,
+        alias: "".into(),
+        services: Default::default(),
+        last_heartbeat: 0,
+        addr: invitor_addr.clone().unwrap(),
+    });
 
     let mut discoveries = ConcurrentDiscovery::empty();
     let sp = StaticProvider::new();
@@ -186,7 +209,7 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         discoveries.add(local_discovery);
     }
 
-    if let Ok(addr) = invitor_addr {
+    if let Some(addr) = invitor_addr {
         sp.add_node_info(NodeInfo::from_parts(addr.node_id, NodeData::from(addr)));
     }
     nodes.iter().for_each(|node| {
@@ -206,27 +229,32 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         .alpns([ALPN.into()].into())
         .bind()
         .await?;
+
+    let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel(1024);
     let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
+    let p2p = P2Protocol::new(msg_sender);
     let router = Router::builder(endpoint.clone())
-        .accept(ALPN, gossip.clone())
+        .accept(GOSSIP_ALPN, gossip.clone())
+        .accept(P2P_ALPN, p2p.clone())
         .spawn()
         .await?;
     let me = endpoint.node_addr().await?;
     log::debug!("My node address: {:?}", me);
 
     // Generate a ticket for ourself.
-    let ticket = match arg_ticket {
-        Ok(ticket) => Ticket::new(Some(ticket.topic()), me.clone()),
-        Err(_) => Ticket::new(None, me.clone()),
+    let ticket = if has_ticket {
+        Ticket::new(topic, me.clone())
+    } else {
+        Ticket::new(None, me.clone())
     };
 
     let bootstrap = nodes
         .iter()
         .map(|node| node.addr.node_id)
-        .chain([invitor])
+        .chain(invitor)
         .collect();
     let bootstrap_nodes: DashMap<NodeId, Node> =
-        nodes.into_iter().map(|node| (node.node_id, node)).collect();
+        nodes.into_iter().map(|node| (node.node_id, node)).chain(invitor_node.map(|node| (node.node_id, node))).collect();
     if !args.primary && bootstrap_nodes.is_empty() {
         return Err(anyhow::anyhow!("No bootstrap nodes found"));
     } else {
@@ -236,11 +264,15 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
     let (sender, receiver) = if args.primary {
         gossip.subscribe(ticket.topic(), bootstrap)?.split()
     } else {
-        gossip
-            .subscribe_and_join(ticket.topic(), bootstrap)
-            .await
-            .map_err(|e| anyhow::anyhow!("Cannot connect to any existing node: {}", e))?
-            .split()
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            gossip.subscribe_and_join(ticket.topic(), bootstrap),
+        )
+        .await
+        {
+            Ok(Ok(res)) => res.split(),
+            _ => return Err(anyhow::anyhow!("Timeout join gossip, please check your ticket")),
+        }
     };
 
     let alias = args.alias.clone().unwrap_or(
@@ -260,7 +292,7 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
 
     let me = Node {
         node_id: pk,
-        invitor,
+        invitor: invitor.unwrap_or(pk),
         addr: me,
         alias,
         services: Default::default(), // reserved
@@ -272,6 +304,7 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         storage,
         router,
         gossip,
+        single_point: p2p,
         ticket,
         nodes: bootstrap_nodes,
         me: Arc::new(me),
@@ -280,16 +313,32 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         pending_auth: DashMap::new(),
     };
 
-    Ok((context, receiver))
+    Ok((context, receiver, msg_receiver, invitor_rnum))
 }
 
 impl Context {
-    pub async fn run(&self, mut receiver: GossipReceiver) {
+    pub async fn run(
+        &self,
+        mut gos_recv: GossipReceiver,
+        mut sp_recv: Receiver<Bytes>,
+        rnum: Option<Vec<u8>>,
+    ) {
         let mut cron_jobs = tokio::time::interval(std::time::Duration::from_secs(30));
         let mut discovery = self.handle.discovery_stream();
 
         // before join the loop, we still need to broadcast some message to bootstrap ourself.
         if self.args.daemon {
+            if let Some(rnum) = rnum {
+                let invited = Message::Invited {
+                    topic: self.ticket.topic(),
+                    rnum,
+                    alias: self.me.alias.clone(),
+                    services: self.me.services.clone(),
+                };
+                if self.broadcast_message(invited).await.is_err() {
+                    log::error!("Failed to broadcast Invited message to bootstrap the network");
+                }
+            }
             let about_me = Message::AboutMe {
                 alias: self.me.alias.clone(),
                 services: self.me.services.clone(),
@@ -301,6 +350,7 @@ impl Context {
         }
 
         // Errors are expected if we are the first node in network.
+        // TODO: a smarter sync strategy
         let sync_req = Message::SyncRequest {
             nodes: Default::default(),
         };
@@ -327,21 +377,16 @@ impl Context {
                     }
                 },
                 item = discovery.try_next() => {
-                    log::debug!("Received discovery item: {:?}", item);
+                    log::trace!("Received discovery item: {:?}", item);
                     self.process_discovery(item.map_err(|lag| anyhow::anyhow!("Lagging discovery: {}", lag))).await;
                 },
-                Some(incoming) = self.handle.accept() => {
-                    log::debug!("Incoming connection: {:?}", incoming);
-                    let connection = match incoming.accept() {
-                        Ok(connecting) => connecting.await,
-                        _ => continue,
-                    };
-                    if let Ok(connection) = connection {
-                        let (_, mut rx) = connection.open_bi().await.unwrap();
-                        self.process_conn(&mut rx).await;
+                Some(bmsg) = sp_recv.recv() => {
+                    if let Ok((from, msg, passed)) = SignedMessage::decode_and_verify(self.clone(), bmsg) {
+                        log::debug!("Received p2p msg: {:?}", msg);
+                        self.process_message(from, msg, passed).await;
                     }
                 },
-                evt = receiver.try_next() => {
+                evt = gos_recv.try_next() => {
                     log::debug!("Received event: {:?}", evt);
                     self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
                 }
@@ -450,8 +495,6 @@ impl Context {
 
     async fn process_discovery(&self, _item: Result<Option<DiscoveryItem>>) {}
 
-    async fn process_conn(&self, rx: &mut RecvStream) {}
-
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
         match evt {
             Ok(Some(evt)) => match evt {
@@ -460,7 +503,13 @@ impl Context {
                         // self.nodes.remove(&public_key);
                         self.pending_auth.remove(&public_key);
                     }
-                    GossipEvent::Received(message) => self.process_message(message).await,
+                    GossipEvent::Received(bmsg) => {
+                        if let Ok((from, msg, passed)) =
+                            SignedMessage::decode_and_verify(self.clone(), bmsg.content)
+                        {
+                            self.process_message(from, msg, passed).await;
+                        }
+                    }
                     _ => {}
                 },
                 Event::Lagged => log::warn!("Gossip network is lagged"),
@@ -470,183 +519,218 @@ impl Context {
         }
     }
 
-    async fn process_message(&self, message: IrohMessage) {
-        if let Ok((id, msg, passed)) =
-            SignedMessage::decode_and_verify(self.clone(), &message.content)
-        {
-            log::debug!("Received message from {:?}", id);
-            log::debug!("Message: {:?}", msg);
+    async fn process_message(&self, from: NodeId, message: Message, passed: bool) {
+        log::debug!("Received message from {:?}", from);
+        log::debug!("Message: {:?}", message);
 
-            match msg {
-                Message::AboutMe {
+        match message {
+            Message::Invited {
+                topic,
+                rnum,
+                alias,
+                services,
+            } => {
+                if !self.ticket.validate(topic, rnum) {
+                    log::error!("Received untrusted Invited message from {:?}", from);
+                    return;
+                }
+
+                let addr = if let Some(info) = self.handle.remote_info(from) {
+                    // We have no relay for sure.
+                    NodeAddr::from_parts(
+                        from,
+                        None,
+                        info.addrs
+                            .iter()
+                            .map(|addr| addr.addr)
+                            .collect::<Vec<SocketAddr>>(),
+                    )
+                } else {
+                    log::error!("No remote info for node: {:?}", from);
+                    return;
+                };
+
+                let node = Node {
+                    node_id: from,
+                    invitor: self.me.node_id,
+                    addr,
                     alias,
                     services,
+                    last_heartbeat: 0,
+                };
+
+                self.pending_auth.remove(&from);
+                self.nodes.insert(from, node);
+                self.ticket.refresh(self.clone());
+                log::info!("Node {} joined the chat", from);
+                log::info!("New Ticket: {}", self.ticket);
+            }
+            Message::AboutMe {
+                alias,
+                services,
+                invitor,
+            } => {
+                let addr = if let Some(info) = self.handle.remote_info(from) {
+                    // We have no relay for sure.
+                    NodeAddr::from_parts(
+                        from,
+                        None,
+                        info.addrs
+                            .iter()
+                            .map(|addr| addr.addr)
+                            .collect::<Vec<SocketAddr>>(),
+                    )
+                } else {
+                    log::error!("No remote info for node: {:?}", from);
+                    return;
+                };
+
+                let node = Node {
+                    node_id: from,
                     invitor,
-                } => {
-                    let addr = if let Some(info) = self.handle.remote_info(id) {
-                        // We have no relay for sure.
-                        NodeAddr::from_parts(
-                            id,
-                            None,
-                            info.addrs
-                                .iter()
-                                .map(|addr| addr.addr)
-                                .collect::<Vec<SocketAddr>>(),
-                        )
-                    } else {
-                        log::error!("No remote info for node: {:?}", id);
-                        return;
-                    };
+                    addr,
+                    alias,
+                    services,
+                    last_heartbeat: 0,
+                };
 
-                    let node = Node {
-                        node_id: id,
-                        invitor,
-                        addr,
-                        alias,
-                        services,
-                        last_heartbeat: 0,
-                    };
-
-                    if self.pending_auth.contains_key(&id) {
-                        let auth = self.pending_auth.get(&id).unwrap();
-                        if auth.introduced {
-                            // We already reveived a message from this node, but it was not introduced.
-                            // Simply update the information.
-                            self.pending_auth.alter(&id, |_, auth| Auth {
-                                introducer: auth.introducer,
-                                introduced: false,
-                                node: auth.node,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs(),
-                            });
-                        } else {
-                            // This node has been introduced, we can trust it now.
-                            self.pending_auth.remove(&id);
-                            self.nodes.insert(id, node);
-                        }
-                    } else {
-                        // This node has not been introduced yet.
-                        let auth = Auth {
-                            introducer: id,
+                if self.pending_auth.contains_key(&from) {
+                    let auth = self.pending_auth.get(&from).unwrap();
+                    if auth.introduced {
+                        // We already reveived a message from this node, but it was not introduced.
+                        // Simply update the information.
+                        self.pending_auth.alter(&from, |_, auth| Auth {
+                            introducer: auth.introducer,
                             introduced: false,
-                            node: Box::new(node).into(),
+                            node: auth.node,
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs(),
-                        };
-                        self.pending_auth.insert(id, auth);
-                    }
-                }
-                Message::Introduce { invited } => {
-                    if !passed {
-                        log::error!("Received untrusted Introduce message from {:?}", id);
-                        return;
-                    }
-                    log::info!("Received Introduce message from {:?}", id);
-                    if self.pending_auth.contains_key(&id) {
-                        let auth = self.pending_auth.get(&id).unwrap();
-                        if auth.introduced {
-                            self.pending_auth.alter(&id, |_, auth| Auth {
-                                introducer: auth.introducer,
-                                introduced: true,
-                                node: auth.node,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs(),
-                            });
-                        } else {
-                            // This node has sent 'AboutMe' message before.
-                            assert!(auth.node.is_some());
-                            if let Some((id, auth)) = self.pending_auth.remove(&id) {
-                                let node = auth.node.unwrap();
-                                self.nodes.insert(id, *node);
-                            }
-                        }
+                        });
                     } else {
-                        let auth = Auth {
-                            introducer: id,
-                            introduced: true,
-                            node: None,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                        };
-                        self.pending_auth.insert(invited, auth);
+                        // This node has been introduced, we can trust it now.
+                        self.pending_auth.remove(&from);
+                        self.nodes.insert(from, node);
                     }
-                }
-                Message::Heartbeat => {
-                    if !passed {
-                        log::error!("Received untrusted Heartbeat message from {:?}", id);
-                        return;
-                    }
-
-                    if let Some(mut node) = self.nodes.get_mut(&id) {
-                        node.last_heartbeat = std::time::SystemTime::now()
+                } else {
+                    // This node has not been introduced yet.
+                    let auth = Auth {
+                        introducer: from,
+                        introduced: false,
+                        node: Box::new(node).into(),
+                        timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
-                            .as_secs();
-                    }
+                            .as_secs(),
+                    };
+                    self.pending_auth.insert(from, auth);
                 }
-                Message::Left => {
-                    if !passed {
-                        log::error!("Received untrusted Left message from {:?}", id);
-                        return;
-                    }
-
-                    if let Some((id, _)) = self.nodes.remove(&id) {
-                        log::info!("Node {} left the chat", id);
-                    }
+            }
+            Message::Introduce { invited } => {
+                if !passed {
+                    log::error!("Received untrusted Introduce message from {:?}", from);
+                    return;
                 }
-                Message::SyncRequest { nodes } => {
-                    if passed {
-                        nodes.iter().for_each(|node| {
-                            let target = self.nodes.get(&node.node_id);
-                            if target.is_some_and(|inner| {
-                                inner.last_heartbeat + 60 < node.last_heartbeat
-                            }) {
-                                self.nodes.insert(node.node_id, node.clone());
-                            }
+                log::info!("Received Introduce message from {:?}", from);
+                if self.pending_auth.contains_key(&from) {
+                    let auth = self.pending_auth.get(&from).unwrap();
+                    if auth.introduced {
+                        self.pending_auth.alter(&from, |_, auth| Auth {
+                            introducer: auth.introducer,
+                            introduced: true,
+                            node: auth.node,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
                         });
-                    }
-
-                    if self.args.daemon {
-                        let nodes = self
-                            .nodes
-                            .iter()
-                            .map(|t| t.value().clone())
-                            .chain([self.me.as_ref().clone()])
-                            .collect::<Vec<_>>();
-
-                        let message = Message::SyncResponse { nodes };
-                        // self.send_message_to(&id, message).await.unwrap();
-                        if let Err(e) = self.broadcast_neighbor_message(message).await {
-                            log::error!("Failed to send SyncResponse to {:?}: {:?}", id, e);
+                    } else {
+                        // This node has sent 'AboutMe' message before.
+                        assert!(auth.node.is_some());
+                        if let Some((id, auth)) = self.pending_auth.remove(&from) {
+                            let node = auth.node.unwrap();
+                            self.nodes.insert(id, *node);
                         }
                     }
+                } else {
+                    let auth = Auth {
+                        introducer: from,
+                        introduced: true,
+                        node: None,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    };
+                    self.pending_auth.insert(invited, auth);
                 }
-                Message::SyncResponse { nodes } => {
-                    // A message from a trusted node is always valid.
-                    // Or if we are a client, we simply trust everything.
-                    if !self.args.daemon || (self.args.daemon && passed) {
-                        nodes.iter().for_each(|node| {
-                            let target = self.nodes.get(&node.node_id);
-                            if target.is_none()
-                                || target.unwrap().last_heartbeat < node.last_heartbeat
-                            {
-                                self.nodes.insert(node.node_id, node.clone());
-                            }
-                        });
-                    }
+            }
+            Message::Heartbeat => {
+                if !passed {
+                    log::error!("Received untrusted Heartbeat message from {:?}", from);
+                    return;
                 }
 
-                #[allow(unreachable_patterns)]
-                _ => log::warn!("Unknown message received"),
+                if let Some(mut node) = self.nodes.get_mut(&from) {
+                    node.last_heartbeat = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                }
             }
+            Message::Left => {
+                if !passed {
+                    log::error!("Received untrusted Left message from {:?}", from);
+                    return;
+                }
+
+                // if let Some((id, _)) = self.nodes.remove(&from) {
+                //     log::info!("Node {} left the chat", id);
+                // }
+            }
+            Message::SyncRequest { nodes } => {
+                if passed {
+                    nodes.iter().for_each(|node| {
+                        let target = self.nodes.get(&node.node_id);
+                        if target
+                            .is_some_and(|inner| inner.last_heartbeat + 60 < node.last_heartbeat)
+                        {
+                            self.nodes.insert(node.node_id, node.clone());
+                        }
+                    });
+                }
+
+                if self.args.daemon {
+                    let nodes = self
+                        .nodes
+                        .iter()
+                        .map(|t| t.value().clone())
+                        .chain([self.me.as_ref().clone()])
+                        .collect::<Vec<_>>();
+
+                    let message = Message::SyncResponse { nodes };
+                    if let Err(e) = self.send_message_to(&from, message).await {
+                        log::error!("Failed to send SyncResponse to {:?}: {:?}", from, e);
+                    }
+                }
+            }
+            Message::SyncResponse { nodes } => {
+                // A message from a trusted node is always valid.
+                // Or if we are a client, we simply trust everything.
+                if !self.args.daemon || (self.args.daemon && passed) {
+                    nodes.iter().for_each(|node| {
+                        let target = self.nodes.get(&node.node_id);
+                        if target.is_none() || target.unwrap().last_heartbeat < node.last_heartbeat
+                        {
+                            self.nodes.insert(node.node_id, node.clone());
+                        }
+                    });
+                }
+            }
+
+            #[allow(unreachable_patterns)]
+            _ => log::warn!("Unknown message received"),
         }
     }
 
@@ -671,23 +755,10 @@ impl Context {
         }
 
         log::debug!("Sending message to {:?}: {:?}", id, message);
-        if let Some(info) = self.handle.remote_info(*id) {
-            let addr = NodeAddr::from(info);
-            match self.handle.connect(addr, ALPN).await {
-                Ok(conn) => {
-                    let bm = SignedMessage::sign_and_encode(self.handle.secret_key(), message)?;
-                    let mut tun = conn.open_uni().await?;
-                    tun.write_all(bm.as_ref()).await?;
-                    Ok(())
-                }
-                Err(e) => Err(anyhow::anyhow!("Failed to connect to {:?}: {:?}", id, e)),
-            }
-        } else {
-            Err(anyhow::anyhow!(
-                "Trying to send message to unknown peer {:?}",
-                id
-            ))
-        }
+        self.single_point
+            .send_msg(self.clone(), *id, message)
+            .await?;
+        Ok(())
     }
 
     pub fn is_node_trusted(&self, id: &NodeId) -> bool {

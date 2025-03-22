@@ -18,10 +18,11 @@ async fn main() -> Result<()> {
     environment_detection(&args);
 
     let storage = init_storage(&args).await?;
+
     match init_network(args, storage).await {
-        Ok((ctx, receiver)) => {
+        Ok((ctx, gos_recv, sp_recv, rnum)) => {
             println!("Ticket: {}", ctx.ticket);
-            ctx.run(receiver).await;
+            ctx.run(gos_recv, sp_recv, rnum).await;
         },
         Err(e) => {
             log::error!("Failed to initialize network: {}", e);
