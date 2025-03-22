@@ -1,12 +1,14 @@
 use anyhow::Result;
 use iroh::{NodeId, PublicKey, SecretKey};
 use redb::{Database, ReadableTable, TableDefinition};
+use serde::Serialize;
 use std::{fs::File, path::Path, str::FromStr, sync::Arc};
 
 use crate::{network::Node, utils::CliArgs};
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 const SECRERT: TableDefinition<&str, &str> = TableDefinition::new("secret");
+const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -97,6 +99,7 @@ impl Storage {
     }
 
     pub fn save_secret(&self, sk: SecretKey) -> Result<(), redb::Error> {
+        // TODO: save secret encrypted?
         let write_txn = self.db.begin_write()?;
 
         {
@@ -128,6 +131,56 @@ impl Storage {
             Ok(None)
         }
     }
+
+    pub fn save_config<W, T>(&self, key: &str, value: T) -> Result<(), redb::Error>
+    where
+        W: AsRef<T>,
+        T: Serialize,
+    {
+        let write_txn = self.db.begin_write()?;
+
+        {
+            let value = postcard::to_allocvec(&value).unwrap();
+            let mut table = write_txn.open_table(CONFIG)?;
+            let _ = table.insert(key, value.as_slice())?;
+        }
+
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_config<T>(&self, key: &str) -> Result<Option<T>, redb::Error>
+    where
+        T: for<'a> serde::Deserialize<'a>,
+    {
+        let read_txn = self.db.begin_read()?;
+
+        let table = match read_txn.open_table(CONFIG) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+
+        let value = table.get(key)?;
+
+        if let Some(value) = value {
+            let value = postcard::from_bytes(value.value()).unwrap();
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn remove_config(&self, key: &str) -> Result<(), redb::Error> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CONFIG)?;
+
+            let _ = table.remove(key)?;
+        }
+
+        write_txn.commit()?;
+        Ok(())
+    }
 }
 
 impl TryFrom<File> for Storage {
@@ -141,7 +194,14 @@ impl TryFrom<File> for Storage {
 }
 
 pub async fn init_storage(args: &CliArgs) -> Result<Storage> {
-    let db_path = crate::utils::default_storage_path(args);
+    let mut db_path = crate::utils::default_config_path(args);
+    db_path.push("storage.db");
+    if !db_path.exists() {
+        log::info!("Creating new database file at {:?}", db_path);
+        std::fs::File::create(&db_path)?;
+    } else {
+        log::debug!("Loading existing database file at {:?}", db_path);
+    }
     let storage = Storage::new(db_path)?;
     Ok(storage)
 }

@@ -1,24 +1,109 @@
 use core::fmt;
-use std::str::FromStr;
+use std::{
+    ops::{Deref, DerefMut},
+    str::FromStr,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
-use clap::{Args, Parser};
+use clap::{Args, Parser, builder::TypedValueParser};
 use iroh::{NodeAddr, node_info::UserData};
 use iroh_gossip::proto::TopicId;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize)]
+use crate::network::Context;
+
+#[derive(Debug, Clone)]
 pub struct Ticket {
+    inner: Arc<RwLock<TicketInner>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TicketInner {
     pub topic: TopicId,
     pub rnum: Vec<u8>,
     pub addr: NodeAddr,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Off,
+}
+
+#[derive(Debug, Default, Clone, Parser)]
+#[command(version, about, long_about = None)]
+pub struct CliArgs {
+    /// Running mode, daemon or client(default)
+    #[arg(short, long, default_value_t = false, group = "backend")]
+    pub daemon: bool,
+
+    /// To be the first node in this p2p network
+    #[arg(long, requires = "backend")]
+    pub primary: bool,
+
+    /// Name of this node, used in dns resolving
+    #[arg(short, long, value_name = "NICKNAME", requires = "backend")]
+    pub alias: Option<String>,
+
+    /// Use ticket string to join a existing network
+    #[arg(short, long, value_name = "TICKET")]
+    pub ticket: Option<String>,
+
+    /// Manually specify the path of the database file
+    #[arg(short, value_name = "CONFIG_PATH", value_hint = clap::ValueHint::DirPath)]
+    pub config: Option<std::path::PathBuf>,
+
+    /// Log level, default is info
+    #[arg(
+        long,
+        short = 'L',
+        default_value_t = LogLevel::Info,
+        value_parser = clap::builder::PossibleValuesParser::new(["trace", "debug", "info", "warn", "error", "off"])
+            .map(|s| s.parse::<LogLevel>().unwrap()),
+    )]
+    log: LogLevel,
+}
+
+impl Ticket {
+    pub fn new(topic: Option<TopicId>, addr: NodeAddr) -> Self {
+        let rnum = rand::random::<[u8; 32]>().to_vec();
+        let topic = topic.unwrap_or_else(|| TopicId::from_bytes(rand::random()));
+        Self {
+            inner: Arc::new(RwLock::new(TicketInner { topic, rnum, addr })),
+        }
+    }
+
+    pub fn topic(&self) -> TopicId {
+        self.inner.read().topic
+    }
+
+    pub fn validate(&self, topic: TopicId, rnum: impl AsRef<[u8]>) -> bool {
+        self.inner.read().topic == topic && self.inner.read().rnum == rnum.as_ref()
+    }
+
+    pub fn load_addr(&self) -> NodeAddr {
+        self.inner.read().addr.clone()
+    }
+
+    pub fn refresh(&self, ctx: Context) {
+        let mut inner = self.inner.write();
+        inner.rnum = rand::random::<[u8; 32]>().to_vec();
+        inner.addr = ctx.me.addr.clone();
+    }
+}
+
 impl fmt::Display for Ticket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let text = postcard::to_stdvec(self).unwrap();
+        let inner = self.inner.read();
+        let text = postcard::to_stdvec(&*inner).unwrap();
         let text = STANDARD_NO_PAD.encode(text);
         write!(f, "{}", text)
     }
@@ -28,42 +113,60 @@ impl FromStr for Ticket {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let bytes = STANDARD_NO_PAD.decode(s)?;
-        postcard::from_bytes(&bytes).map_err(|e| anyhow::anyhow!(e))
+        let inner: Result<TicketInner> =
+            postcard::from_bytes(&bytes).map_err(|e| anyhow::anyhow!(e));
+        inner.map(|inner| Self {
+            inner: Arc::new(RwLock::new(inner)),
+        })
     }
 }
 
-#[derive(Debug, Default, Clone, Parser)]
-#[command(version, about, long_about = None)]
-pub struct CliArgs {
-    /// Running mode, client or daemon
-    #[command(flatten)]
-    pub running_mode: RunningMode,
-
-    /// To be the first node in this p2p network
-    #[arg(long, group = "daemon")]
-    pub primary: bool,
-
-    /// Name of this node, used in dns resolving
-    #[arg(short, long, value_name = "NICKNAME", requires = "daemon")]
-    pub alias: Option<String>,
-
-    /// Use ticket string to join a existing network
-    #[arg(short, long, value_name = "TICKET")]
-    pub ticket: Option<String>,
-
-    /// Manually specify the path of the database file
-    #[arg(short = 'D', value_name = "FILENAME", value_hint = clap::ValueHint::FilePath)]
-    pub database: Option<std::path::PathBuf>,
+impl Default for LogLevel {
+    fn default() -> Self {
+        LogLevel::Info
+    }
 }
 
-#[derive(Debug, Clone, Default, Args)]
-#[group(required = true, multiple = false)]
-pub struct RunningMode {
-    #[arg(short, long, group = "client")]
-    pub client: bool,
+impl From<LogLevel> for log::LevelFilter {
+    fn from(value: LogLevel) -> Self {
+        match value {
+            LogLevel::Trace => log::LevelFilter::Trace,
+            LogLevel::Debug => log::LevelFilter::Debug,
+            LogLevel::Info => log::LevelFilter::Info,
+            LogLevel::Warn => log::LevelFilter::Warn,
+            LogLevel::Error => log::LevelFilter::Error,
+            LogLevel::Off => log::LevelFilter::Off,
+        }
+    }
+}
 
-    #[arg(short, long, group = "daemon")]
-    pub daemon: bool,
+impl FromStr for LogLevel {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let level = match s {
+            "trace" => LogLevel::Trace,
+            "debug" => LogLevel::Debug,
+            "info" => LogLevel::Info,
+            "warn" => LogLevel::Warn,
+            "error" => LogLevel::Error,
+            "off" => LogLevel::Off,
+            _ => anyhow::bail!("Invalid log level: {}", s),
+        };
+        Ok(level.into())
+    }
+}
+
+impl ToString for LogLevel {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Trace => "trace".to_string(),
+            Self::Debug => "debug".to_string(),
+            Self::Info => "info".to_string(),
+            Self::Warn => "warn".to_string(),
+            Self::Error => "error".to_string(),
+            Self::Off => "off".to_string(),
+        }
+    }
 }
 
 impl CliArgs {
@@ -77,26 +180,50 @@ impl CliArgs {
         }
         Ok(())
     }
+
+    pub fn apply(&self) {
+        env_logger::Builder::new()
+            .filter_module("iroh", log::LevelFilter::Off)
+            .filter_module("iroh_gossip", log::LevelFilter::Off)
+            .filter_module("tracing::span", log::LevelFilter::Off)
+            .filter_level(self.log.into())
+            .init();
+    }
 }
 
-pub(crate) fn default_storage_path(args: &CliArgs) -> PathBuf {
+pub(crate) fn environment_detection(args: &CliArgs) {
+    // check if the user has permission to write to the default storage path
+    let mut path = default_config_path(args);
+    let error;
+    if !path.exists() {
+        error = std::fs::create_dir_all(&path).is_err();
+    } else {
+        path.push(".test");
+        error = std::fs::File::create(&path).is_err();
+    }
+
+    if error {
+        eprintln!("Cannot write to the default storage path: {:?}", path);
+        eprintln!("Please run the program with sudo or specify a different path");
+        std::process::exit(1);
+    }
+}
+
+pub(crate) fn default_config_path(args: &CliArgs) -> PathBuf {
     // depending on platform and running_mode, return the default path
-    if let Some(path) = &args.database {
+    if let Some(path) = &args.config {
         return path.clone();
     }
 
-    let mut path = if args.running_mode.daemon {
-        // Daemon mode uses system paths
-        if cfg!(target_os = "windows") {
-            PathBuf::from(r"C:\ProgramData\p2p-ddns")
-        } else if cfg!(target_os = "macos") {
-            PathBuf::from("/Library/Application Support/p2p-ddns")
-        } else {
-            // Linux and others
-            PathBuf::from("/etc/p2p-ddns")
-        }
+    let privileged_path = if cfg!(target_os = "windows") {
+        PathBuf::from(r"C:\ProgramData\p2p-ddns")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Application Support/p2p-ddns")
     } else {
-        // Client mode uses user home directory
+        // Linux and others
+        PathBuf::from("/etc/p2p-ddns")
+    };
+    let normal_path = {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
         if cfg!(target_os = "windows") {
@@ -111,6 +238,28 @@ pub(crate) fn default_storage_path(args: &CliArgs) -> PathBuf {
         }
     };
 
-    path.push("nodes.db");
-    path
+    // Check if the user has permission to write to the default storage path
+    if args.daemon {
+        let test_file = privileged_path.join("test");
+        if test_file.exists() {
+            match std::fs::remove_dir(&test_file) {
+                Ok(_) => privileged_path,
+                Err(_) => normal_path,
+            }
+        } else {
+            match std::fs::create_dir_all(&test_file) {
+                Ok(_) => {
+                    std::fs::remove_dir(&test_file).ok();
+                    privileged_path
+                }
+                Err(_) => normal_path,
+            }
+        }
+    } else {
+        normal_path
+    }
+}
+
+pub fn output(ctx: Context) {
+    println!("{:?}", ctx.nodes);
 }

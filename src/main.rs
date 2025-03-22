@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use network::init_network;
 use storage::init_storage;
-use utils::CliArgs;
+use utils::{environment_detection, CliArgs};
 
 mod host;
 mod network;
@@ -13,10 +13,18 @@ mod utils;
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
     CliArgs::validate(&args)?;
+    CliArgs::apply(&args);
+    environment_detection(&args);
 
     let storage = init_storage(&args).await?;
-    let (ctx, receiver) = init_network(args, storage).await?;
-
-    ctx.run(receiver).await;
+    match init_network(args, storage).await {
+        Ok((ctx, receiver)) => {
+            println!("Ticket: {}", ctx.ticket);
+            ctx.run(receiver).await;
+        },
+        Err(e) => {
+            log::error!("Failed to initialize network: {}", e);
+        }
+    }
     Ok(())
 }

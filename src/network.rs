@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, hash::Hash, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{cmp::max, collections::BTreeMap, hash::Hash, net::SocketAddr, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -7,7 +7,10 @@ use ed25519::Signature;
 use futures_lite::StreamExt;
 use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, SecretKey,
-    discovery::static_provider::StaticProvider,
+    discovery::{
+        ConcurrentDiscovery, local_swarm_discovery::LocalSwarmDiscovery,
+        static_provider::StaticProvider,
+    },
     node_info::{NodeData, NodeInfo, UserData},
     protocol::Router,
 };
@@ -15,6 +18,11 @@ use iroh_gossip::{
     ALPN,
     net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender, Message as IrohMessage},
     proto::TopicId,
+};
+use rand::{
+    Rng,
+    distributions::{Alphanumeric, DistString},
+    thread_rng,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,8 +66,12 @@ impl SignedMessage {
 
         key.verify(&signed_message.data, &signed_message.signature)?;
         let message: Message = postcard::from_bytes(&signed_message.data)?;
-        let pass = ctx.is_node_trusted(&key);
-        Ok((signed_message.from, message, pass))
+        let passed = ctx.is_node_trusted(&key)
+            && signed_message.timestamp - 10
+                < std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+        Ok((signed_message.from, message, passed))
     }
 
     pub fn sign_and_encode(secret_key: &SecretKey, message: Message) -> Result<Bytes> {
@@ -84,7 +96,7 @@ impl SignedMessage {
 pub struct Node {
     pub node_id: NodeId,
     pub invitor: NodeId,
-    addr: NodeAddr,
+    pub(crate) addr: NodeAddr,
     alias: String,
     services: BTreeMap<String, u32>,
     last_heartbeat: u64,
@@ -105,7 +117,7 @@ pub struct Context {
     pub storage: Storage,
     pub router: Router,
     pub gossip: Gossip,
-    pub topic: TopicId,
+    pub ticket: Ticket,
     pub nodes: DashMap<NodeId, Node>,
     pub me: Arc<Node>,
     pub sender: GossipSender,
@@ -142,6 +154,10 @@ impl PartialEq for Auth {
 impl Eq for Auth {}
 
 pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, GossipReceiver)> {
+    let nodes = storage.load_nodes()?;
+
+    // Try to load the secret key from storage, if not found, generate a new one.
+    // The public key is used as the node ID to be acknowledged by other nodes.
     let (pk, sk) = storage.load_secret()?.unwrap_or_else(|| {
         let sk = SecretKey::generate(rand::rngs::OsRng);
         let pk = sk.public();
@@ -149,8 +165,19 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         (pk, sk)
     });
 
-    let nodes = storage.load_nodes()?;
+    // Set up bootstrap nodes with ticket and storage
+    let arg_ticket = Ticket::from_str(args.ticket.as_deref().unwrap_or("".into()));
+    let invitor_addr = arg_ticket.as_ref().map(|t| t.load_addr());
+    let invitor = match invitor_addr.as_ref() {
+        Ok(addr) => addr.node_id,
+        Err(_) => pk.clone(),
+    };
+
+    let mut discoveries = ConcurrentDiscovery::empty();
     let sp = StaticProvider::new();
+    if let Ok(addr) = invitor_addr {
+        sp.add_node_info(NodeInfo::from_parts(addr.node_id, NodeData::from(addr)));
+    }
     nodes.iter().for_each(|node| {
         let info = NodeInfo {
             node_id: node.node_id,
@@ -158,64 +185,76 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
         };
         sp.add_node_info(info);
     });
+    discoveries.add(sp);
 
-    // TODO: distinguish daemon and client mode
+    if args.daemon {
+        let local_discovery = LocalSwarmDiscovery::new(pk).unwrap();
+        discoveries.add(local_discovery);
+    }
+
     // TODO: dynamic ALPN name
+    // endpoint-protocol(gossip)-router are iroh components
     let endpoint = Endpoint::builder()
         .relay_mode(iroh::RelayMode::Disabled)
         .secret_key(sk)
-        .add_discovery(|_| Some(sp))
-        .discovery_local_network()
-        .discovery_dht()
+        .add_discovery(|_| Some(discoveries))
         .bind()
         .await?;
-
+    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
+    let router = Router::builder(endpoint.clone())
+        .accept(ALPN, gossip.clone())
+        .spawn()
+        .await?;
     let me = endpoint.node_addr().await?;
+
+    // Generate a ticket for ourself.
+    let ticket = match arg_ticket {
+        Ok(ticket) => Ticket::new(Some(ticket.topic()), me.clone()),
+        Err(_) => Ticket::new(None, me.clone()),
+    };
+
+    let bootstrap = nodes.iter().map(|node| node.addr.node_id).collect();
+
+    let (sender, receiver) = if args.primary {
+        gossip.subscribe(ticket.topic(), bootstrap)?.split()
+    } else {
+        gossip
+            .subscribe_and_join(ticket.topic(), bootstrap)
+            .await
+            .map_err(|e| anyhow::anyhow!("Cannot connect to any existing node: {}", e))?
+            .split()
+    };
+
+    let alias = args.alias.clone().unwrap_or(
+        thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(6)
+            .map(char::from)
+            .collect(),
+    );
+
+    // for now, this takes no effect since we don't handle discovery events manually.
     endpoint.set_user_data_for_discovery(
         args.alias
             .clone()
             .map(|alias| UserData::from_str(alias.as_str()).unwrap()),
     );
 
-    let ticket = if args.primary {
-        let topic = TopicId::from_bytes(rand::random());
-        let rnum = rand::random::<[u8; 32]>().to_vec();
-        Ticket {
-            topic,
-            rnum,
-            addr: me.clone(),
-        }
-    } else {
-        Ticket::from_str(&args.ticket.clone().unwrap())?
-    };
-
     let me = Node {
         node_id: pk,
-        invitor: ticket.addr.node_id,
+        invitor,
         addr: me,
-        alias: args.alias.clone().unwrap_or_else(|| "Unknown".to_string()),
-        services: Default::default(),
+        alias,
+        services: Default::default(), // reserved
         last_heartbeat: 0,
     };
-
-    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
-    let router = Router::builder(endpoint.clone())
-        .accept(ALPN, gossip.clone())
-        .spawn()
-        .await?;
-
-    let bootstrap = nodes.iter().map(|node| node.addr.node_id).collect();
-    let (sender, receiver) = gossip
-        .subscribe_and_join(ticket.topic, bootstrap)
-        .await?
-        .split();
 
     let context = Context {
         handle: endpoint,
         storage,
         router,
         gossip,
-        topic: ticket.topic,
+        ticket,
         nodes: DashMap::new(),
         me: Arc::new(me),
         sender,
@@ -229,6 +268,25 @@ pub async fn init_network(args: CliArgs, storage: Storage) -> Result<(Context, G
 impl Context {
     pub async fn run(&self, mut receiver: GossipReceiver) {
         let mut cron_jobs = tokio::time::interval(std::time::Duration::from_secs(30));
+
+        // before join the loop, we still need to broadcast some message to bootstrap ourself.
+        if self.args.daemon {
+            let about_me = Message::AboutMe {
+                alias: self.me.alias.clone(),
+                services: self.me.services.clone(),
+                invitor: self.me.invitor,
+            };
+            if self.broadcast_message(about_me).await.is_err() && !self.args.primary {
+                log::error!("Failed to broadcast AboutMe message to bootstrap the network");
+            }
+        }
+
+        // Errors are expected if we are the first node in network.
+        let sync_req = Message::SyncRequest {
+            nodes: Default::default(),
+        };
+        let _ = self.broadcast_neighbor_message(sync_req).await;
+
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
@@ -237,8 +295,15 @@ impl Context {
                     break;
                 },
                 _ = cron_jobs.tick() => {
-                    let _ = self.broadcast_message(Message::Heartbeat).await;
+                    if self.args.daemon {
+                        let _ = self.broadcast_message(Message::Heartbeat).await;
+                    }
+
                     self.cleanup().await;
+                    self.update_nodes().await;
+                    if let Err(e) = self.save().await {
+                        log::error!("Failed to save nodes to storage: {:?}", e);
+                    }
                 },
                 evt = receiver.try_next() => {
                     self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
@@ -248,9 +313,14 @@ impl Context {
     }
 
     pub async fn graceful_shutdown(&self) {
-        let me = self.me.clone();
         let _ = self.broadcast_message(Message::Left).await;
-        self.nodes.remove(&me.node_id);
+        let _ = self.save().await;
+        let _ = self.router.shutdown().await;
+        self.handle.close().await;
+    }
+
+    pub async fn save(&self) -> Result<()> {
+        self.nodes.remove(&self.me.node_id);
 
         log::info!("Saving {} nodes to storage", self.nodes.len());
         let nodes = self
@@ -258,9 +328,9 @@ impl Context {
             .iter()
             .map(|it| it.value().clone())
             .collect::<Vec<_>>();
-        self.storage
-            .batch_save_nodes(nodes.into_iter())
-            .expect("Failed to save nodes while shutting down");
+        self.storage.batch_save_nodes(nodes.into_iter())?;
+
+        Ok(())
     }
 
     pub async fn cleanup(&self) {
@@ -271,6 +341,71 @@ impl Context {
 
         self.pending_auth
             .retain(|_, auth| now - auth.timestamp < 60 * 5);
+
+        // Clean up nodes that have the same alias name.
+        // Find nodes with duplicate aliases, keeping only the most recent one
+        let mut by_alias: std::collections::HashMap<String, (NodeId, u64)> =
+            std::collections::HashMap::new();
+        for pair in self.nodes.iter() {
+            let node = pair.value();
+            by_alias
+                .entry(node.alias.clone())
+                .and_modify(|(id, heartbeat)| {
+                    if node.last_heartbeat > *heartbeat {
+                        *id = node.node_id;
+                        *heartbeat = node.last_heartbeat;
+                    }
+                })
+                .or_insert((node.node_id, node.last_heartbeat));
+        }
+
+        // Remove nodes that have the same alias but aren't the most recent
+        for pair in self.nodes.iter() {
+            let node = pair.value();
+            if let Some((best_id, _)) = by_alias.get(&node.alias) {
+                if *best_id != node.node_id {
+                    self.nodes.remove(&node.node_id);
+                }
+            }
+        }
+    }
+
+    pub async fn update_nodes(&self) {
+        for info in self.handle.remote_info_iter() {
+            let id = info.node_id;
+
+            // we don't care the node not in self.nodes, since it's authenticated.
+            if self.nodes.contains_key(&id) {
+                self.nodes.alter(&id, |_, mut node| {
+                    // update heartbeat timestamp
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let iroh_timestamp = now - info.last_used.map_or(0, |t| t.as_secs());
+                    let local_timestamp = node.last_heartbeat;
+                    node.last_heartbeat = max(iroh_timestamp, local_timestamp);
+
+                    // update ip addresses
+                    info.addrs.iter().for_each(|addr| {
+                        if !node.addr.direct_addresses.contains(&addr.addr) {
+                            node.addr.direct_addresses.insert(addr.addr);
+                        }
+                    });
+
+                    node
+                });
+            }
+        }
+
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|it| it.value().clone())
+            .collect::<Vec<_>>();
+        let _ = self
+            .broadcast_neighbor_message(Message::SyncRequest { nodes })
+            .await;
     }
 
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
@@ -297,6 +432,7 @@ impl Context {
         {
             log::debug!("Received message from {:?}", id);
             log::debug!("Message: {:?}", msg);
+
             match msg {
                 Message::AboutMe {
                     alias,
@@ -444,7 +580,9 @@ impl Context {
                     self.send_message_to(&id, message).await.unwrap();
                 }
                 Message::SyncResponse { nodes } => {
-                    if self.args.running_mode.client || (self.args.running_mode.daemon && passed) {
+                    // A message from a trusted node is always valid.
+                    // Or if we are a client, we simply trust everything.
+                    if !self.args.daemon || (self.args.daemon && passed) {
                         nodes.iter().for_each(|node| {
                             let target = self.nodes.get(&node.node_id);
                             if target.is_none()
@@ -476,6 +614,10 @@ impl Context {
     }
 
     pub async fn send_message_to(&self, id: &NodeId, message: Message) -> Result<()> {
+        if id == &self.me.node_id {
+            return Ok(());
+        }
+
         if let Some(info) = self.handle.remote_info(*id) {
             let addr = NodeAddr::from(info);
             match self.handle.connect(addr, ALPN).await {
