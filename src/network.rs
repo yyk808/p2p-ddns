@@ -112,9 +112,9 @@ pub struct Node {
     pub node_id: NodeId,
     pub invitor: NodeId,
     pub(crate) addr: NodeAddr,
-    alias: String,
-    services: BTreeMap<String, u32>,
-    last_heartbeat: u64,
+    pub alias: String,
+    pub services: BTreeMap<String, u32>,
+    pub last_heartbeat: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +179,8 @@ pub async fn init_network(
     }
 
     let nodes = storage.load_nodes()?;
+    log::debug!("Loaded {} nodes from storage", nodes.len());
+    log::debug!("Nodes: {:?}", nodes);
 
     // Try to load the secret key from storage, if not found, generate a new one.
     // The public key is used as the node ID to be acknowledged by other nodes.
@@ -196,14 +198,6 @@ pub async fn init_network(
     let (invitor, invitor_addr, invitor_rnum, topic) = arg_ticket
         .map(|(topic, rnum, addr)| (Some(addr.node_id), Some(addr), Some(rnum), Some(topic)))
         .unwrap_or((None, None, None, None));
-    let invitor_node = invitor.map(|id| Node {
-        node_id: id,
-        invitor: id,
-        alias: "".into(),
-        services: Default::default(),
-        last_heartbeat: 0,
-        addr: invitor_addr.clone().unwrap(),
-    });
 
     let mut discoveries = ConcurrentDiscovery::empty();
     let sp = StaticProvider::new();
@@ -272,7 +266,7 @@ pub async fn init_network(
         gossip.subscribe(ticket.topic(), bootstrap)?.split()
     } else {
         match tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(10),
             gossip.subscribe_and_join(ticket.topic(), bootstrap),
         )
         .await
@@ -378,9 +372,8 @@ impl Context {
                     if self.args.daemon {
                         let _ = self.broadcast_message(Message::Heartbeat).await;
                         self.update_nodes().await;
-                    } else {
-                        output(self.clone());
                     }
+                    output(self.clone());
 
                     self.cleanup().await;
                     if let Err(e) = self.save().await {
@@ -395,6 +388,8 @@ impl Context {
                     if let Ok((from, msg, passed)) = SignedMessage::decode_and_verify(self.clone(), bmsg) {
                         log::debug!("Received p2p msg: {:?}", msg);
                         self.process_message(from, msg, passed).await;
+                    } else {
+                        log::error!("Failed to decode and verify message from p2p");
                     }
                 },
                 evt = gos_recv.try_next() => {

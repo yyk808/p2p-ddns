@@ -39,6 +39,7 @@ impl P2Protocol {
     }
 
     async fn recv_msg(recv: &mut RecvStream) -> Result<Bytes> {
+        log::debug!("Receiving message p2p");
         let mut incoming_len = [0u8; 8];
         recv.read_exact(&mut incoming_len).await?;
         let len = u64::from_le_bytes(incoming_len);

@@ -2,7 +2,7 @@ use core::fmt;
 use std::{
     ops::{Deref, DerefMut},
     str::FromStr,
-    sync::Arc,
+    sync::Arc, time::Duration,
 };
 
 use anyhow::Result;
@@ -12,6 +12,7 @@ use iroh::{NodeAddr, node_info::UserData};
 use iroh_gossip::proto::TopicId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tabled::{settings::{object::Columns, Style}, Tabled};
 use std::path::PathBuf;
 
 use crate::network::Context;
@@ -275,6 +276,35 @@ pub(crate) fn default_config_path(args: &CliArgs) -> PathBuf {
     }
 }
 
+fn format_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+
+    format!("{}Hour {}Min {}Sec ago", hours, minutes, seconds)
+}
+
 pub fn output(ctx: Context) {
-    log::info!("{:?}", ctx.nodes);
+    let data = ctx.nodes.iter().map(|r| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let node = r.value();
+        // find out the first addr start with 10.xxx or 192.168.xxx
+        let addr = node.addr.direct_addresses.iter().find(|addr| {
+            addr.is_ipv4() && !addr.ip().is_loopback() && !addr.ip().is_multicast()
+        }).map(|addr| addr.to_string()).unwrap_or_else(|| "Unknown".to_string());
+        let alias = node.alias.clone();
+        let last_seen = format_duration(now - node.last_heartbeat);
+        (addr, alias, last_seen)
+    }).collect::<Vec<_>>();
+
+    let mut builder = tabled::builder::Builder::default();
+    builder.push_record(["Address", "Name", "Last Seen"]);
+    for (addr, alias, last_seen) in data {
+        builder.push_record([addr, alias, last_seen]);
+    }
+    let table = builder.build();
+    println!("{}", table);
 }
