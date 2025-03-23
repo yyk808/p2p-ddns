@@ -2,7 +2,7 @@ use anyhow::Result;
 use iroh::{NodeId, PublicKey, SecretKey};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
-use std::{fs::File, path::Path, str::FromStr, sync::Arc};
+use std::{borrow::Borrow, fs::File, path::Path, str::FromStr, sync::Arc};
 
 use crate::{network::Node, utils::CliArgs};
 
@@ -23,12 +23,14 @@ impl Storage {
         Ok(Self { db })
     }
 
-    pub fn load_nodes(&self) -> Result<Vec<Node>, redb::Error> {
+    pub fn load_nodes<T>(&self) -> Result<T, redb::Error>
+        where T: Default + IntoIterator<Item = Node> + FromIterator<Node>
+    {
         let read_txn = self.db.begin_read()?;
 
         let table = match read_txn.open_table(TABLE) {
             Ok(table) => table,
-            Err(_) => return Ok(vec![]),
+            Err(_) => return Ok(T::default()),
         };
 
         let first_entry = table.first().unwrap();
@@ -40,11 +42,11 @@ impl Storage {
                     let (_, v) = t.unwrap();
                     postcard::from_bytes(v.value()).unwrap()
                 })
-                .collect();
+                .collect::<T>();
 
             Ok(nodes)
         } else {
-            Ok(vec![])
+            Ok(T::default())
         }
     }
 
@@ -65,7 +67,7 @@ impl Storage {
 
     pub fn batch_save_nodes<I, T>(&self, node_iter: I) -> Result<(), redb::Error>
     where
-        I: Iterator<Item = T>,
+        I: IntoIterator<Item = T>,
         T: Into<Node>,
     {
         let write_txn = self.db.begin_write()?;
@@ -143,6 +145,21 @@ impl Storage {
             let value = postcard::to_allocvec(&value).unwrap();
             let mut table = write_txn.open_table(CONFIG)?;
             let _ = table.insert(key, value.as_slice())?;
+        }
+
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn save_config_trival<T>(&self, key: &str, value: T) -> Result<(), redb::Error>
+    where
+        T: Serialize + Copy + ?Sized,
+    {
+        let write_txn = self.db.begin_write()?;
+
+        {
+            let mut table = write_txn.open_table(CONFIG)?;
+            let _ = table.insert(key, postcard::to_allocvec(&value).unwrap().as_slice())?;
         }
 
         write_txn.commit()?;
@@ -233,8 +250,8 @@ mod test {
             nodes.push(Node::random_node());
         }
 
-        storage.batch_save_nodes(nodes.clone().into_iter()).unwrap();
-        let loaded_nodes = storage.load_nodes().unwrap();
+        storage.batch_save_nodes(nodes.clone()).unwrap();
+        let loaded_nodes = storage.load_nodes::<Vec<_>>().unwrap();
 
         assert_eq!(nodes.len(), loaded_nodes.len());
 

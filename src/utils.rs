@@ -1,14 +1,12 @@
 use core::fmt;
 use std::{
-    ops::{Deref, DerefMut},
-    str::FromStr,
-    sync::Arc, time::Duration,
+    hash::Hash, ops::{Deref, DerefMut}, str::FromStr, sync::Arc, time::Duration
 };
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Args, Parser, builder::TypedValueParser};
-use iroh::{NodeAddr, node_info::UserData};
+use iroh::{node_info::{NodeInfo, UserData}, NodeAddr};
 use iroh_gossip::proto::TopicId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -38,6 +36,9 @@ pub enum LogLevel {
     Error,
     Off,
 }
+
+#[derive(Debug, Clone)]
+pub struct WrappedNodeInfo(pub NodeInfo);
 
 #[derive(Debug, Default, Clone, Parser)]
 #[command(version, about, long_about = None)]
@@ -72,6 +73,9 @@ pub struct CliArgs {
     )]
     log: LogLevel,
 
+    #[arg(long, short = 'B', value_name = "BIND_ADDR")]
+    pub bind: Option<String>,
+
     /// For debug convinience
     #[cfg(debug_assertions)]
     #[arg(long)]
@@ -79,6 +83,7 @@ pub struct CliArgs {
 }
 
 impl Ticket {
+    // TODO: don't use addr but node directly
     pub fn new(topic: Option<TopicId>, addr: NodeAddr) -> Self {
         let rnum = rand::random::<[u8; 32]>().to_vec();
         let topic = topic.unwrap_or_else(|| TopicId::from_bytes(rand::random()));
@@ -187,6 +192,27 @@ impl ToString for LogLevel {
     }
 }
 
+impl Hash for WrappedNodeInfo {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.node_id.hash(state);
+        self.0.direct_addresses().hash(state);
+    }
+}
+
+impl PartialEq for WrappedNodeInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.node_id == other.0.node_id && self.0.direct_addresses() == other.0.direct_addresses()
+    }
+}
+
+impl Eq for WrappedNodeInfo {}
+
+impl From<NodeInfo> for WrappedNodeInfo {
+    fn from(node: NodeInfo) -> Self {
+        Self(node)
+    }
+}
+
 impl CliArgs {
     pub fn validate(args: &Self) -> Result<()> {
         if args
@@ -195,6 +221,10 @@ impl CliArgs {
             .is_some_and(|s| s.len() >= UserData::MAX_LENGTH)
         {
             anyhow::bail!("alias length should be less than {}", UserData::MAX_LENGTH);
+        }
+
+        if args.bind.as_ref().is_some_and(|b| !b.parse::<std::net::SocketAddr>().is_ok_and(|addr| addr.is_ipv4())) {
+            anyhow::bail!("Invalid bind address: {}, only accept IPv4 address for now", args.bind.as_ref().unwrap());
         }
 
         Ok(())
@@ -274,6 +304,13 @@ pub(crate) fn default_config_path(args: &CliArgs) -> PathBuf {
     } else {
         normal_path
     }
+}
+
+pub fn time_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn format_duration(seconds: u64) -> String {

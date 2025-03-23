@@ -1,17 +1,22 @@
 use std::{
-    cmp::max, collections::BTreeMap, hash::Hash, net::SocketAddr, str::FromStr, sync::Arc,
+    cmp::max,
+    collections::{BTreeMap, HashSet},
+    hash::Hash,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    str::FromStr,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
 use anyhow::Result;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use ed25519::Signature;
 use futures_lite::StreamExt;
 use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, SecretKey,
     discovery::{
-        ConcurrentDiscovery, DiscoveryItem, local_swarm_discovery::LocalSwarmDiscovery,
+        ConcurrentDiscovery, Discovery, DiscoveryItem, local_swarm_discovery::LocalSwarmDiscovery,
         static_provider::StaticProvider,
     },
     endpoint::RecvStream,
@@ -20,7 +25,10 @@ use iroh::{
 };
 use iroh_gossip::{
     ALPN,
-    net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender, Message as IrohMessage},
+    net::{
+        Event, Gossip, GossipEvent, GossipReceiver, GossipSender, JoinOptions,
+        Message as IrohMessage,
+    },
     proto::TopicId,
 };
 use rand::{
@@ -34,7 +42,7 @@ use tokio::sync::mpsc::Receiver;
 use crate::{
     protocol::P2Protocol,
     storage::Storage,
-    utils::{CliArgs, Ticket, TicketInner, output},
+    utils::{CliArgs, Ticket, TicketInner, WrappedNodeInfo, output, time_now},
 };
 
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
@@ -81,11 +89,7 @@ impl SignedMessage {
 
         key.verify(&signed_message.data, &signed_message.signature)?;
         let message: Message = postcard::from_bytes(&signed_message.data)?;
-        let passed = ctx.is_node_trusted(&key)
-            && signed_message.timestamp - 10
-                < std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs();
+        let passed = ctx.is_node_trusted(&key) && signed_message.timestamp < time_now() + 10;
         Ok((signed_message.from, message, passed))
     }
 
@@ -93,9 +97,7 @@ impl SignedMessage {
         let data: Bytes = postcard::to_stdvec(&message)?.into();
         let signature = secret_key.sign(&data);
         let from: PublicKey = secret_key.public();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        let timestamp = time_now();
         let signed_message = Self {
             from,
             data,
@@ -178,9 +180,16 @@ pub async fn init_network(
         storage.clear()?;
     }
 
-    let nodes = storage.load_nodes()?;
-    log::debug!("Loaded {} nodes from storage", nodes.len());
-    log::debug!("Nodes: {:?}", nodes);
+    let bind_addr;
+    if let Some(bind) = &args.bind {
+        bind_addr = bind.parse::<SocketAddrV4>()?;
+    } else if let Ok(Some(port)) = storage.load_config::<u16>("bind_port") {
+        bind_addr = SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), port);
+    } else {
+        let port = rand::random::<u16>();
+        storage.save_config_trival::<u16>("bind_port", port)?;
+        bind_addr = SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), 0);
+    }
 
     // Try to load the secret key from storage, if not found, generate a new one.
     // The public key is used as the node ID to be acknowledged by other nodes.
@@ -199,31 +208,23 @@ pub async fn init_network(
         .map(|(topic, rnum, addr)| (Some(addr.node_id), Some(addr), Some(rnum), Some(topic)))
         .unwrap_or((None, None, None, None));
 
+    // Set up discovery:
+    // 1. Local discovery - only for daemon mode
+    // 2. Static discovery - always
     let mut discoveries = ConcurrentDiscovery::empty();
+
+    let local_discovery = LocalSwarmDiscovery::new(pk).unwrap();
+    discoveries.add(local_discovery);
+
     let sp = StaticProvider::new();
     discoveries.add(sp.clone());
-
-    if args.daemon {
-        let local_discovery = LocalSwarmDiscovery::new(pk).unwrap();
-        discoveries.add(local_discovery);
-    }
-
-    if let Some(addr) = invitor_addr {
-        sp.add_node_info(NodeInfo::from_parts(addr.node_id, NodeData::from(addr)));
-    }
-    nodes.iter().for_each(|node| {
-        let info = NodeInfo {
-            node_id: node.node_id,
-            data: NodeData::from(node.addr.clone()),
-        };
-        sp.add_node_info(info);
-    });
 
     // TODO: dynamic ALPN name
     // endpoint-protocol(gossip)-router are iroh components
     let endpoint = Endpoint::builder()
         .relay_mode(iroh::RelayMode::Disabled)
         .secret_key(sk)
+        .bind_addr_v4(bind_addr)
         .add_discovery(|_| Some(discoveries))
         .alpns([ALPN.into()].into())
         .bind()
@@ -242,40 +243,115 @@ pub async fn init_network(
 
     // Generate a ticket for ourself.
     let ticket = if has_ticket {
+        storage.save_config_trival::<TopicId>("topic", topic.unwrap())?;
         Ticket::new(topic, me.clone())
-    } else {
+    } else if args.primary{
         Ticket::new(None, me.clone())
+    } else {
+        if let Ok(Some(topic)) = storage.load_config::<TopicId>("topic") {
+            Ticket::new(Some(topic), me.clone())
+        } else {
+            log::error!("We need a ticket to join the network, or set [--primary] to create a new network");
+            return Err(anyhow::anyhow!("Network config not found in both storage and ticket"));
+        }
     };
 
-    let bootstrap: Vec<_> = nodes
-        .iter()
-        .map(|node| node.addr.node_id)
-        .chain(invitor)
-        .collect();
-    let bootstrap_nodes: DashMap<NodeId, Node> = nodes
+    // Loaded nodes from storage may be outdated
+    // They should be updated with discoveries.
+    // Priority:
+    // mdns discovery -> Ticket -> static discovery(inherited from storage)
+    let bootstrap_nodes = storage
+        .load_nodes::<Vec<_>>()?
         .into_iter()
         .map(|node| (node.node_id, node))
-        .collect();
-    if !args.primary && bootstrap.is_empty() {
-        return Err(anyhow::anyhow!("No bootstrap nodes found"));
-    } else {
-        log::debug!("Bootstrap nodes: {:?}", bootstrap);
+        .collect::<DashMap<NodeId, Node>>();
+
+    // Setting up static discovery with storage
+    bootstrap_nodes.iter().for_each(|node| {
+        let info = NodeInfo {
+            node_id: node.node_id,
+            data: NodeData::from(node.addr.clone()),
+        };
+        sp.add_node_info(info);
+    });
+
+    // Setting up static discovery with ticket
+    if let Some(addr) = invitor_addr {
+        sp.set_node_info(NodeInfo::from_parts(
+            addr.node_id,
+            NodeData::from(addr.clone()),
+        ));
+        // FIXME: may overwrite the previous one, load node from ticket
+        bootstrap_nodes.insert(
+            addr.node_id,
+            Node {
+                node_id: addr.node_id,
+                invitor: addr.node_id,
+                addr,
+                alias: "".into(),
+                services: Default::default(),
+                last_heartbeat: 0,
+            },
+        );
+    }
+
+    let update_bootstrap = || {
+        endpoint.remote_info_iter().for_each(|info| {
+            let now = time_now();
+            let iroh_timestamp = now - info.last_used.map_or(0, |t| t.as_secs());
+            let should_update = {
+                let target = bootstrap_nodes.get(&info.node_id);
+                target.is_none()
+                    || target
+                        .as_ref()
+                        .map_or(false, |t| t.last_heartbeat < iroh_timestamp + 10)
+            };
+            if should_update {
+                let last_heartbeat = info.last_used.map_or(0, |t| t.as_secs());
+                let id = info.node_id;
+                let addr = NodeAddr::from(info);
+                bootstrap_nodes.alter(&id, |_, mut v| {
+                    v.addr = addr;
+                    v.last_heartbeat = last_heartbeat;
+                    v
+                });
+            }
+        })
+    };
+
+    let load_bootstrap = || {
+        bootstrap_nodes
+            .iter()
+            .map(|node| node.addr.node_id)
+            .collect::<Vec<_>>()
+    };
+
+    update_bootstrap();
+    if !args.primary && load_bootstrap().is_empty() {
+        log::warn!("No bootstrap nodes found, add one with ticket or waiting for mdns discovery");
     }
 
     let (sender, receiver) = if args.primary {
-        gossip.subscribe(ticket.topic(), bootstrap)?.split()
+        gossip.subscribe(ticket.topic(), load_bootstrap())?.split()
     } else {
-        match tokio::time::timeout(
-            Duration::from_secs(10),
-            gossip.subscribe_and_join(ticket.topic(), bootstrap),
-        )
-        .await
-        {
-            Ok(Ok(res)) => res.split(),
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Timeout join gossip, please check your ticket"
-                ));
+        let mut retry = 1u8;
+        loop {
+            if retry > 5 {
+                return Err(anyhow::anyhow!("Failed to join gossip"));
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                gossip.subscribe_and_join(ticket.topic(), load_bootstrap()),
+            )
+            .await
+            {
+                Ok(Ok(res)) => break res.split(),
+                _ => {
+                    log::warn!("Timeout joining gossip, retrying {} times...", retry);
+                    update_bootstrap();
+                    retry += 1;
+                }
             }
         }
     };
@@ -301,7 +377,7 @@ pub async fn init_network(
         addr: me,
         alias,
         services: Default::default(), // reserved
-        last_heartbeat: 0,
+        last_heartbeat: time_now(),
     };
 
     let context = Context {
@@ -424,11 +500,7 @@ impl Context {
     }
 
     pub async fn cleanup(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
+        let now = time_now();
         self.pending_auth
             .retain(|_, auth| now - auth.timestamp < 60 * 5);
 
@@ -466,6 +538,8 @@ impl Context {
         for node_id in nodes_to_remove {
             self.nodes.remove(&node_id);
         }
+
+        self.handle.network_change().await;
     }
 
     pub async fn update_nodes(&self) {
@@ -476,10 +550,7 @@ impl Context {
             if self.nodes.contains_key(&id) {
                 self.nodes.alter(&id, |_, mut node| {
                     // update heartbeat timestamp
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
+                    let now = time_now();
                     let iroh_timestamp = now - info.last_used.map_or(0, |t| t.as_secs());
                     let local_timestamp = node.last_heartbeat;
                     node.last_heartbeat = max(iroh_timestamp, local_timestamp);
@@ -507,7 +578,15 @@ impl Context {
             .await;
     }
 
-    async fn process_discovery(&self, _item: Result<Option<DiscoveryItem>>) {}
+    async fn process_discovery(&self, item: Result<Option<DiscoveryItem>>) {
+        static CACHE: LazyLock<DashSet<WrappedNodeInfo>> = LazyLock::new(|| DashSet::new());
+        match item {
+            Ok(Some(item)) => {
+                let addr = item.into_node_addr();
+            }
+            _ => {}
+        }
+    }
 
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
         match evt {
@@ -539,10 +618,7 @@ impl Context {
 
         if passed {
             self.nodes.alter(&from, |_, mut node| {
-                node.last_heartbeat = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+                node.last_heartbeat = time_now();
                 node
             });
         }
@@ -629,10 +705,7 @@ impl Context {
                             introducer: auth.introducer,
                             introduced: false,
                             node: auth.node,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
+                            timestamp: time_now(),
                         });
                     } else {
                         // This node has been introduced, we can trust it now.
@@ -645,10 +718,7 @@ impl Context {
                         introducer: from,
                         introduced: false,
                         node: Box::new(node).into(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
+                        timestamp: time_now(),
                     };
                     self.pending_auth.insert(from, auth);
                 }
@@ -666,10 +736,7 @@ impl Context {
                             introducer: auth.introducer,
                             introduced: true,
                             node: auth.node,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
+                            timestamp: time_now(),
                         });
                     } else {
                         // This node has sent 'AboutMe' message before.
@@ -684,10 +751,7 @@ impl Context {
                         introducer: from,
                         introduced: true,
                         node: None,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
+                        timestamp: time_now(),
                     };
                     self.pending_auth.insert(invited, auth);
                 }
@@ -753,6 +817,8 @@ impl Context {
             #[allow(unreachable_patterns)]
             _ => log::warn!("Unknown message received"),
         }
+
+        self.handle.network_change().await;
     }
 
     pub async fn broadcast_message(&self, message: Message) -> Result<()> {
@@ -777,7 +843,8 @@ impl Context {
         log::debug!("Sending message to {:?}: {:?}", id, message);
         self.single_point
             .send_msg(self.clone(), *id, message)
-            .await?;
+            .await
+            .inspect_err(|e| log::error!("Failed to send message to {:?}: {:?}", id, e))?;
         Ok(())
     }
 

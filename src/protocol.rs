@@ -3,9 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::{
-    NodeId,
-    endpoint::{RecvStream, SendStream},
-    protocol::ProtocolHandler,
+    endpoint::{RecvStream, SendStream, VarInt}, protocol::ProtocolHandler, NodeId
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -34,7 +32,7 @@ impl P2Protocol {
         send.write_all(&(encoded.len() as u64).to_le_bytes())
             .await?;
         send.write_all(&encoded).await?;
-        send.finish()?;
+        // send.finish()?;
         Ok(())
     }
 
@@ -50,10 +48,10 @@ impl P2Protocol {
     }
 
     async fn handle_connection(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
-        let (mut send, mut recv) = conn.await?.accept_bi().await?;
+        let mut recv = conn.await?.accept_uni().await?;
         let msg = Self::recv_msg(&mut recv).await?;
         self.msg_sender.send(msg).await?;
-        send.finish()?;
+        recv.stop(VarInt::from_u32(0))?;
         Ok(())
     }
 }
@@ -66,7 +64,9 @@ impl ProtocolHandler for P2Protocol {
         let proto = self.clone();
         Box::pin(async move {
             log::debug!("Accepting connection in p2p protocol");
-            proto.handle_connection(conn).await?;
+            if let Err(e) = proto.handle_connection(conn).await {
+                log::error!("Failed to handle connection in p2p protocol: {}", e);
+            }
             Ok(())
         })
     }
