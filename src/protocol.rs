@@ -1,16 +1,9 @@
-use std::sync::Arc;
-
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::{
-    endpoint::{RecvStream, SendStream, VarInt}, protocol::ProtocolHandler, Endpoint, NodeAddr, NodeId
-};
-use tokio::sync::{
-    mpsc::{Receiver, Sender},
-    oneshot::Receiver as ShutdownReceiver,
-};
+use iroh::{Endpoint, NodeAddr, endpoint::RecvStream, protocol::ProtocolHandler};
+use tokio::sync::mpsc::Sender;
 
-use crate::network::{Context, Message, SignedMessage};
+use crate::network::{Message, SignedMessage};
 
 #[derive(Debug, Clone)]
 pub struct P2Protocol {
@@ -24,7 +17,12 @@ impl P2Protocol {
         Self { msg_sender }
     }
 
-    pub async fn send_msg(&self, ep: Endpoint, target: impl Into<NodeAddr>, msg: Message) -> Result<()> {
+    pub async fn send_msg(
+        &self,
+        ep: Endpoint,
+        target: impl Into<NodeAddr>,
+        msg: Message,
+    ) -> Result<()> {
         let conn = ep.connect(target, P2Protocol::P2P_ALPN).await?;
         let encoded = SignedMessage::sign_and_encode(ep.secret_key(), msg)?;
 
@@ -79,7 +77,6 @@ mod test {
     use super::*;
 
     use iroh::{RelayMode, endpoint::Endpoint, protocol::Router};
-    use iroh_gossip::ALPN;
 
     #[tokio::test]
     async fn test_p2p_protocol() {
@@ -129,10 +126,7 @@ mod test {
 
         tokio::time::timeout(Duration::from_secs(3), async move {
             let target = ep2.node_addr().await.unwrap();
-            proto1
-                .send_msg(ep1.clone(), target, msg)
-                .await
-                .unwrap();
+            proto1.send_msg(ep1.clone(), target, msg).await.unwrap();
         })
         .await
         .unwrap();

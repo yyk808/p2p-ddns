@@ -1,19 +1,16 @@
 use core::fmt;
-use std::{
-    hash::Hash, ops::{Deref, DerefMut}, str::FromStr, sync::Arc, time::Duration
-};
+use std::{fmt::Display, hash::Hash, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
-use clap::{Args, Parser, builder::TypedValueParser};
-use iroh::{node_info::{NodeInfo, UserData}, NodeAddr};
+use clap::{Parser, builder::TypedValueParser};
+use iroh::node_info::{NodeInfo, UserData};
 use iroh_gossip::proto::TopicId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tabled::{settings::{object::Columns, Style}, Tabled};
 use std::path::PathBuf;
 
-use crate::network::Context;
+use crate::network::{Context, Node};
 
 #[derive(Debug, Clone)]
 pub struct Ticket {
@@ -24,13 +21,14 @@ pub struct Ticket {
 pub struct TicketInner {
     pub topic: TopicId,
     pub rnum: Vec<u8>,
-    pub addr: NodeAddr,
+    pub invitor: Node,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum LogLevel {
     Trace,
     Debug,
+    #[default]
     Info,
     Warn,
     Error,
@@ -84,11 +82,15 @@ pub struct CliArgs {
 
 impl Ticket {
     // TODO: don't use addr but node directly
-    pub fn new(topic: Option<TopicId>, addr: NodeAddr) -> Self {
+    pub fn new(topic: Option<TopicId>, node: Node) -> Self {
         let rnum = rand::random::<[u8; 32]>().to_vec();
         let topic = topic.unwrap_or_else(|| TopicId::from_bytes(rand::random()));
         Self {
-            inner: Arc::new(RwLock::new(TicketInner { topic, rnum, addr })),
+            inner: Arc::new(RwLock::new(TicketInner {
+                topic,
+                rnum,
+                invitor: node,
+            })),
         }
     }
 
@@ -100,19 +102,15 @@ impl Ticket {
         self.inner.read().topic == topic && self.inner.read().rnum == rnum.as_ref()
     }
 
-    pub fn load_addr(&self) -> NodeAddr {
-        self.inner.read().addr.clone()
-    }
-
-    pub fn flatten(&self) -> (TopicId, Vec<u8>, NodeAddr) {
+    pub fn flatten(&self) -> (TopicId, Vec<u8>, Node) {
         let inner = self.inner.read();
-        (inner.topic, inner.rnum.clone(), inner.addr.clone())
+        (inner.topic, inner.rnum.clone(), inner.invitor.clone())
     }
 
     pub fn refresh(&self, ctx: Context) {
         let mut inner = self.inner.write();
         inner.rnum = rand::random::<[u8; 32]>().to_vec();
-        inner.addr = ctx.me.addr.clone();
+        inner.invitor = (*ctx.me).clone();
     }
 }
 
@@ -144,12 +142,6 @@ impl FromStr for Ticket {
     }
 }
 
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Info
-    }
-}
-
 impl From<LogLevel> for log::LevelFilter {
     fn from(value: LogLevel) -> Self {
         match value {
@@ -175,20 +167,21 @@ impl FromStr for LogLevel {
             "off" => LogLevel::Off,
             _ => anyhow::bail!("Invalid log level: {}", s),
         };
-        Ok(level.into())
+        Ok(level)
     }
 }
 
-impl ToString for LogLevel {
-    fn to_string(&self) -> String {
-        match self {
-            Self::Trace => "trace".to_string(),
-            Self::Debug => "debug".to_string(),
-            Self::Info => "info".to_string(),
-            Self::Warn => "warn".to_string(),
-            Self::Error => "error".to_string(),
-            Self::Off => "off".to_string(),
-        }
+impl Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let text = match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+            LogLevel::Off => "off",
+        };
+        write!(f, "{}", text)
     }
 }
 
@@ -223,8 +216,14 @@ impl CliArgs {
             anyhow::bail!("alias length should be less than {}", UserData::MAX_LENGTH);
         }
 
-        if args.bind.as_ref().is_some_and(|b| !b.parse::<std::net::SocketAddr>().is_ok_and(|addr| addr.is_ipv4())) {
-            anyhow::bail!("Invalid bind address: {}, only accept IPv4 address for now", args.bind.as_ref().unwrap());
+        if args.bind.as_ref().is_some_and(|b| {
+            !b.parse::<std::net::SocketAddr>()
+                .is_ok_and(|addr| addr.is_ipv4())
+        }) {
+            anyhow::bail!(
+                "Invalid bind address: {}, only accept IPv4 address for now",
+                args.bind.as_ref().unwrap()
+            );
         }
 
         Ok(())
@@ -240,13 +239,12 @@ impl CliArgs {
 pub(crate) fn environment_detection(args: &CliArgs) {
     // check if the user has permission to write to the default storage path
     let mut path = default_config_path(args);
-    let error;
-    if !path.exists() {
-        error = std::fs::create_dir_all(&path).is_err();
+    let error = if !path.exists() {
+        std::fs::create_dir_all(&path).is_err()
     } else {
         path.push(".test");
-        error = std::fs::File::create(&path).is_err();
-    }
+        std::fs::File::create(&path).is_err()
+    };
 
     if error {
         eprintln!("Cannot write to the default storage path: {:?}", path);
@@ -322,20 +320,30 @@ fn format_duration(seconds: u64) -> String {
 }
 
 pub fn output(ctx: Context) {
-    let data = ctx.nodes.iter().map(|r| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let node = r.value();
-        // find out the first addr start with 10.xxx or 192.168.xxx
-        let addr = node.addr.direct_addresses.iter().find(|addr| {
-            addr.is_ipv4() && !addr.ip().is_loopback() && !addr.ip().is_multicast()
-        }).map(|addr| addr.ip().to_string()).unwrap_or_else(|| "Unknown".to_string());
-        let alias = node.alias.clone();
-        let last_seen = format_duration(now - node.last_heartbeat);
-        (addr, alias, last_seen)
-    }).collect::<Vec<_>>();
+    let data = ctx
+        .nodes
+        .iter()
+        .map(|r| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let node = r.value();
+            // find out the first addr start with 10.xxx or 192.168.xxx
+            let addr = node
+                .addr
+                .direct_addresses
+                .iter()
+                .find(|addr| {
+                    addr.is_ipv4() && !addr.ip().is_loopback() && !addr.ip().is_multicast()
+                })
+                .map(|addr| addr.ip().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let alias = node.alias.clone();
+            let last_seen = format_duration(now - node.last_heartbeat);
+            (addr, alias, last_seen)
+        })
+        .collect::<Vec<_>>();
 
     let mut builder = tabled::builder::Builder::default();
     builder.push_record(["Address", "Name", "Last Seen"]);

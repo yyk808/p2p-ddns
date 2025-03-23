@@ -1,48 +1,40 @@
 use std::{
     cmp::max,
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     hash::Hash,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::Result;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use ed25519::Signature;
 use futures_lite::StreamExt;
 use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, SecretKey,
     discovery::{
-        ConcurrentDiscovery, Discovery, DiscoveryItem, local_swarm_discovery::LocalSwarmDiscovery,
+        ConcurrentDiscovery, DiscoveryItem, local_swarm_discovery::LocalSwarmDiscovery,
         static_provider::StaticProvider,
     },
-    endpoint::RecvStream,
     node_info::{NodeData, NodeInfo, UserData},
     protocol::Router,
 };
 use iroh_gossip::{
     ALPN,
-    net::{
-        Event, Gossip, GossipEvent, GossipReceiver, GossipSender, JoinOptions,
-        Message as IrohMessage,
-    },
+    net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender},
     proto::TopicId,
 };
-use rand::{
-    Rng,
-    distributions::{Alphanumeric, DistString},
-    thread_rng,
-};
+use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Receiver;
 
 use crate::{
     protocol::P2Protocol,
     storage::Storage,
-    utils::{CliArgs, Ticket, TicketInner, WrappedNodeInfo, output, time_now},
+    utils::{CliArgs, Ticket, output, time_now},
 };
 
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
@@ -191,6 +183,14 @@ pub async fn init_network(
         bind_addr = SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), 0);
     }
 
+    let alias = args.alias.clone().unwrap_or(
+        thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(6)
+            .map(char::from)
+            .collect(),
+    );
+
     // Try to load the secret key from storage, if not found, generate a new one.
     // The public key is used as the node ID to be acknowledged by other nodes.
     let (pk, sk) = storage.load_secret()?.unwrap_or_else(|| {
@@ -201,11 +201,11 @@ pub async fn init_network(
     });
 
     // Set up bootstrap nodes with ticket and storage
-    let arg_ticket = Ticket::from_str(args.ticket.as_deref().unwrap_or("".into()));
+    let arg_ticket = Ticket::from_str(args.ticket.as_deref().unwrap_or(""));
     let arg_ticket = arg_ticket.map(|t| t.flatten());
     let has_ticket = arg_ticket.is_ok();
-    let (invitor, invitor_addr, invitor_rnum, topic) = arg_ticket
-        .map(|(topic, rnum, addr)| (Some(addr.node_id), Some(addr), Some(rnum), Some(topic)))
+    let (invitor, invitor_node, invitor_rnum, topic) = arg_ticket
+        .map(|(topic, rnum, node)| (Some(node.node_id), Some(node), Some(rnum), Some(topic)))
         .unwrap_or((None, None, None, None));
 
     // Set up discovery:
@@ -238,22 +238,31 @@ pub async fn init_network(
         .accept(P2P_ALPN, p2p.clone())
         .spawn()
         .await?;
-    let me = endpoint.node_addr().await?;
-    log::debug!("My node address: {:?}", me);
+    let me = Node {
+        node_id: pk,
+        invitor: invitor.unwrap_or(pk),
+        addr: endpoint.node_addr().await?,
+        alias,
+        services: Default::default(), // reserved
+        last_heartbeat: time_now(),
+    };
+    log::debug!("My node: {:?}", me);
 
     // Generate a ticket for ourself.
     let ticket = if has_ticket {
         storage.save_config_trival::<TopicId>("topic", topic.unwrap())?;
         Ticket::new(topic, me.clone())
-    } else if args.primary{
+    } else if args.primary {
         Ticket::new(None, me.clone())
+    } else if let Ok(Some(topic)) = storage.load_config::<TopicId>("topic") {
+        Ticket::new(Some(topic), me.clone())
     } else {
-        if let Ok(Some(topic)) = storage.load_config::<TopicId>("topic") {
-            Ticket::new(Some(topic), me.clone())
-        } else {
-            log::error!("We need a ticket to join the network, or set [--primary] to create a new network");
-            return Err(anyhow::anyhow!("Network config not found in both storage and ticket"));
-        }
+        log::error!(
+            "We need a ticket to join the network, or set [--primary] to create a new network"
+        );
+        return Err(anyhow::anyhow!(
+            "Network config not found in both storage and ticket"
+        ));
     };
 
     // Loaded nodes from storage may be outdated
@@ -276,23 +285,12 @@ pub async fn init_network(
     });
 
     // Setting up static discovery with ticket
-    if let Some(addr) = invitor_addr {
+    if let Some(node) = invitor_node {
         sp.set_node_info(NodeInfo::from_parts(
-            addr.node_id,
-            NodeData::from(addr.clone()),
+            node.node_id,
+            NodeData::from(node.addr.clone()),
         ));
-        // FIXME: may overwrite the previous one, load node from ticket
-        bootstrap_nodes.insert(
-            addr.node_id,
-            Node {
-                node_id: addr.node_id,
-                invitor: addr.node_id,
-                addr,
-                alias: "".into(),
-                services: Default::default(),
-                last_heartbeat: 0,
-            },
-        );
+        bootstrap_nodes.insert(node.node_id, node);
     }
 
     let update_bootstrap = || {
@@ -304,7 +302,7 @@ pub async fn init_network(
                 target.is_none()
                     || target
                         .as_ref()
-                        .map_or(false, |t| t.last_heartbeat < iroh_timestamp + 10)
+                        .is_some_and(|t| t.last_heartbeat < iroh_timestamp + 10)
             };
             if should_update {
                 let last_heartbeat = info.last_used.map_or(0, |t| t.as_secs());
@@ -356,29 +354,12 @@ pub async fn init_network(
         }
     };
 
-    let alias = args.alias.clone().unwrap_or(
-        thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(6)
-            .map(char::from)
-            .collect(),
-    );
-
     // for now, this takes no effect since we don't handle discovery events manually.
     endpoint.set_user_data_for_discovery(
         args.alias
             .clone()
             .map(|alias| UserData::from_str(alias.as_str()).unwrap()),
     );
-
-    let me = Node {
-        node_id: pk,
-        invitor: invitor.unwrap_or(pk),
-        addr: me,
-        alias,
-        services: Default::default(), // reserved
-        last_heartbeat: time_now(),
-    };
 
     let context = Context {
         handle: endpoint,
@@ -578,15 +559,7 @@ impl Context {
             .await;
     }
 
-    async fn process_discovery(&self, item: Result<Option<DiscoveryItem>>) {
-        static CACHE: LazyLock<DashSet<WrappedNodeInfo>> = LazyLock::new(|| DashSet::new());
-        match item {
-            Ok(Some(item)) => {
-                let addr = item.into_node_addr();
-            }
-            _ => {}
-        }
-    }
+    async fn process_discovery(&self, _item: Result<Option<DiscoveryItem>>) {}
 
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
         match evt {
@@ -764,14 +737,14 @@ impl Context {
                 }
             }
             Message::SyncRequest { nodes } => {
-                if !self.args.daemon || (self.args.daemon && passed) {
+                if !self.args.daemon || passed {
                     nodes.iter().for_each(|node| {
                         let should_update = {
                             let target = self.nodes.get(&node.node_id);
                             target.is_none()
                                 || target
                                     .as_ref()
-                                    .map_or(false, |t| t.last_heartbeat < node.last_heartbeat)
+                                    .is_some_and(|t| t.last_heartbeat < node.last_heartbeat)
                         };
                         if should_update {
                             log::debug!("Updating node: {:?}", node);
@@ -797,14 +770,14 @@ impl Context {
             Message::SyncResponse { nodes } => {
                 // A message from a trusted node is always valid.
                 // Or if we are a client, we simply trust everything.
-                if !self.args.daemon || (self.args.daemon && passed) {
+                if !self.args.daemon || passed {
                     nodes.iter().for_each(|node| {
                         let should_update = {
                             let target = self.nodes.get(&node.node_id);
                             target.is_none()
                                 || target
                                     .as_ref()
-                                    .map_or(false, |t| t.last_heartbeat < node.last_heartbeat)
+                                    .is_some_and(|t| t.last_heartbeat < node.last_heartbeat)
                         };
                         if should_update {
                             log::debug!("Updating node: {:?}", node);

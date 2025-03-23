@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use network::init_network;
 use storage::init_storage;
-use utils::{environment_detection, CliArgs};
+use utils::{CliArgs, environment_detection};
 
 mod host;
 mod network;
@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         Ok((ctx, gos_recv, sp_recv, rnum)) => {
             log::info!("Ticket: {}", ctx.ticket);
             ctx.run(gos_recv, sp_recv, rnum).await;
-        },
+        }
         Err(e) => {
             log::error!("Failed to initialize network: {}", e);
         }

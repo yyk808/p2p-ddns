@@ -2,7 +2,7 @@ use anyhow::Result;
 use iroh::{NodeId, PublicKey, SecretKey};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
-use std::{borrow::Borrow, fs::File, path::Path, str::FromStr, sync::Arc};
+use std::{fs::File, path::Path, str::FromStr, sync::Arc};
 
 use crate::{network::Node, utils::CliArgs};
 
@@ -24,7 +24,8 @@ impl Storage {
     }
 
     pub fn load_nodes<T>(&self) -> Result<T, redb::Error>
-        where T: Default + IntoIterator<Item = Node> + FromIterator<Node>
+    where
+        T: Default + IntoIterator<Item = Node> + FromIterator<Node>,
     {
         let read_txn = self.db.begin_read()?;
 
@@ -134,7 +135,7 @@ impl Storage {
         }
     }
 
-    pub fn save_config<W, T>(&self, key: &str, value: T) -> Result<(), redb::Error>
+    pub fn save_config<W, T>(&self, key: &str, value: W) -> Result<(), redb::Error>
     where
         W: AsRef<T>,
         T: Serialize,
@@ -142,7 +143,7 @@ impl Storage {
         let write_txn = self.db.begin_write()?;
 
         {
-            let value = postcard::to_allocvec(&value).unwrap();
+            let value = postcard::to_allocvec(value.as_ref()).unwrap();
             let mut table = write_txn.open_table(CONFIG)?;
             let _ = table.insert(key, value.as_slice())?;
         }
@@ -153,7 +154,7 @@ impl Storage {
 
     pub fn save_config_trival<T>(&self, key: &str, value: T) -> Result<(), redb::Error>
     where
-        T: Serialize + Copy + ?Sized,
+        T: Serialize + Copy,
     {
         let write_txn = self.db.begin_write()?;
 
