@@ -331,7 +331,7 @@ pub fn output(ctx: Context) {
         // find out the first addr start with 10.xxx or 192.168.xxx
         let addr = node.addr.direct_addresses.iter().find(|addr| {
             addr.is_ipv4() && !addr.ip().is_loopback() && !addr.ip().is_multicast()
-        }).map(|addr| addr.to_string()).unwrap_or_else(|| "Unknown".to_string());
+        }).map(|addr| addr.ip().to_string()).unwrap_or_else(|| "Unknown".to_string());
         let alias = node.alias.clone();
         let last_seen = format_duration(now - node.last_heartbeat);
         (addr, alias, last_seen)

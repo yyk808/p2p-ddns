@@ -48,7 +48,7 @@ use crate::{
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
 pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     Invited {
         topic: TopicId,
@@ -76,8 +76,8 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SignedMessage {
-    from: NodeId,
-    data: Bytes,
+    pub(crate) from: NodeId,
+    pub(crate) data: Bytes,
     signature: Signature,
     timestamp: u64,
 }
@@ -842,7 +842,7 @@ impl Context {
 
         log::debug!("Sending message to {:?}: {:?}", id, message);
         self.single_point
-            .send_msg(self.clone(), *id, message)
+            .send_msg(self.handle.clone(), *id, message)
             .await
             .inspect_err(|e| log::error!("Failed to send message to {:?}: {:?}", id, e))?;
         Ok(())
