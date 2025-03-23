@@ -1,6 +1,6 @@
 [package]
-name = "p2p-ddns2"
-version = "0.1.0"
+name = "p2p-ddns"
+version = "0.0.9" # almost done :)
 edition = "2024"
 
 [dependencies]

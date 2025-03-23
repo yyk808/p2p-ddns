@@ -2555,8 +2555,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
-name = "p2p-ddns2"
-version = "0.1.0"
+name = "p2p-ddns"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "base64",
