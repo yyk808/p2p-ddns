@@ -10,9 +10,10 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
+use compio::runtime::time::{interval, timeout};
 use dashmap::DashMap;
 use ed25519::Signature;
-use futures_lite::StreamExt;
+use futures::{channel::mpsc::Receiver, StreamExt, FutureExt, TryStreamExt};
 use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, SecretKey,
     discovery::{
@@ -29,7 +30,6 @@ use iroh_gossip::{
 };
 use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Receiver;
 
 use crate::{
     protocol::P2Protocol,
@@ -193,7 +193,7 @@ pub async fn init_network(
 
     // Try to load the secret key from storage, if not found, generate a new one.
     // The public key is used as the node ID to be acknowledged by other nodes.
-    let (pk, sk) = storage.load_secret()?.unwrap_or_else(|| {
+    let (pk, sk) = storage.load_secret()?.unwrap_or_else(#[inline]|| {
         let sk = SecretKey::generate(rand::rngs::OsRng);
         let pk = sk.public();
         storage.save_secret(sk.clone()).unwrap();
@@ -230,7 +230,7 @@ pub async fn init_network(
         .bind()
         .await?;
 
-    let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel(1024);
+    let (msg_sender, msg_receiver) = futures::channel::mpsc::channel(1024);
     let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
     let p2p = P2Protocol::new(msg_sender);
     let router = Router::builder(endpoint.clone())
@@ -293,7 +293,8 @@ pub async fn init_network(
         bootstrap_nodes.insert(node.node_id, node);
     }
 
-    let update_bootstrap = || {
+
+    fn update_bootstrap(endpoint: Endpoint, bootstrap_nodes: &DashMap<NodeId, Node>) {
         endpoint.remote_info_iter().for_each(|info| {
             let now = time_now();
             let iroh_timestamp = now - info.last_used.map_or(0, |t| t.as_secs());
@@ -315,22 +316,22 @@ pub async fn init_network(
                 });
             }
         })
-    };
+    }
 
-    let load_bootstrap = || {
+    fn load_bootstrap (bootstrap_nodes: &DashMap<PublicKey, Node>) -> Vec<NodeId> {
         bootstrap_nodes
             .iter()
             .map(|node| node.addr.node_id)
             .collect::<Vec<_>>()
-    };
+    }
 
-    update_bootstrap();
-    if !args.primary && load_bootstrap().is_empty() {
+    update_bootstrap(endpoint.clone(), &bootstrap_nodes);
+    if !args.primary && load_bootstrap(&bootstrap_nodes).is_empty() {
         log::warn!("No bootstrap nodes found, add one with ticket or waiting for mdns discovery");
     }
 
     let (sender, receiver) = if args.primary {
-        gossip.subscribe(ticket.topic(), load_bootstrap())?.split()
+        gossip.subscribe(ticket.topic(), load_bootstrap(&bootstrap_nodes))?.split()
     } else {
         let mut retry = 1u8;
         loop {
@@ -338,16 +339,16 @@ pub async fn init_network(
                 return Err(anyhow::anyhow!("Failed to join gossip"));
             }
 
-            match tokio::time::timeout(
+            match timeout(
                 Duration::from_secs(3),
-                gossip.subscribe_and_join(ticket.topic(), load_bootstrap()),
+                gossip.subscribe_and_join(ticket.topic(), load_bootstrap(&bootstrap_nodes)),
             )
             .await
             {
                 Ok(Ok(res)) => break res.split(),
                 _ => {
                     log::warn!("Timeout joining gossip, retrying {} times...", retry);
-                    update_bootstrap();
+                    update_bootstrap(endpoint.clone(), &bootstrap_nodes);
                     retry += 1;
                 }
             }
@@ -385,7 +386,7 @@ impl Context {
         mut sp_recv: Receiver<Bytes>,
         rnum: Option<Vec<u8>>,
     ) {
-        let mut cron_jobs = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut cron_jobs = interval(std::time::Duration::from_secs(30));
         let mut discovery = self.handle.discovery_stream();
 
         // before join the loop, we still need to broadcast some message to bootstrap ourself.
@@ -418,14 +419,18 @@ impl Context {
         };
         let _ = self.broadcast_neighbor_message(sync_req).await;
 
+
         loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+            let mut ctrlc = compio::signal::ctrl_c().fuse();
+            let ctrlc = std::pin::pin!(ctrlc);
+
+            futures::select! {
+                _ = ctrlc.fuse() => {
                     log::info!("Shutting down...");
                     self.graceful_shutdown().await;
                     break;
                 },
-                _ = cron_jobs.tick() => {
+                _ = cron_jobs.tick().fuse() => {
                     if self.args.daemon {
                         let _ = self.broadcast_message(Message::Heartbeat).await;
                         self.update_nodes().await;
@@ -437,19 +442,21 @@ impl Context {
                         log::error!("Failed to save nodes to storage: {:?}", e);
                     }
                 },
-                item = discovery.try_next() => {
+                item = discovery.try_next().fuse() => {
                     log::trace!("Received discovery item: {:?}", item);
                     self.process_discovery(item.map_err(|lag| anyhow::anyhow!("Lagging discovery: {}", lag))).await;
                 },
-                Some(bmsg) = sp_recv.recv() => {
-                    if let Ok((from, msg, passed)) = SignedMessage::decode_and_verify(self.clone(), bmsg) {
-                        log::debug!("Received p2p msg: {:?}", msg);
-                        self.process_message(from, msg, passed).await;
-                    } else {
-                        log::error!("Failed to decode and verify message from p2p");
+                bmsg = sp_recv.next().fuse() => {
+                    if let Some(bmsg) = bmsg {
+                        if let Ok((from, msg, passed)) = SignedMessage::decode_and_verify(self.clone(), bmsg) {
+                            log::debug!("Received p2p msg: {:?}", msg);
+                            self.process_message(from, msg, passed).await;
+                        } else {
+                            log::error!("Failed to decode and verify message from p2p");
+                        }
                     }
                 },
-                evt = gos_recv.try_next() => {
+                evt = gos_recv.try_next().fuse() => {
                     self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
                 }
             }

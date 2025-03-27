@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
+use futures::{channel::mpsc::Sender, future::BoxFuture, SinkExt};
 use iroh::{Endpoint, NodeAddr, endpoint::RecvStream, protocol::ProtocolHandler};
-use tokio::sync::mpsc::Sender;
 
 use crate::network::{Message, SignedMessage};
 
@@ -49,7 +49,7 @@ impl P2Protocol {
     async fn handle_connection(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
         let mut recv = conn.await?.accept_uni().await?;
         let msg = Self::recv_msg(&mut recv).await?;
-        self.msg_sender.send(msg).await?;
+        self.msg_sender.clone().send(msg).await?;
         Ok(())
     }
 }
@@ -58,7 +58,7 @@ impl ProtocolHandler for P2Protocol {
     fn accept(
         &self,
         conn: iroh::endpoint::Connecting,
-    ) -> futures_lite::future::Boxed<anyhow::Result<()>> {
+    ) -> BoxFuture<'static, Result<()>> {
         let proto = self.clone();
         Box::pin(async move {
             log::debug!("Accepting connection in p2p protocol");
@@ -76,13 +76,14 @@ mod test {
 
     use super::*;
 
+    use futures::StreamExt;
     use iroh::{RelayMode, endpoint::Endpoint, protocol::Router};
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_p2p_protocol() {
         env_logger::init();
-        let (sender1, _) = tokio::sync::mpsc::channel(1);
-        let (sender2, mut msg_recv) = tokio::sync::mpsc::channel(1);
+        let (sender1, _) = futures::channel::mpsc::channel(1);
+        let (sender2, mut msg_recv) = futures::channel::mpsc::channel(1);
         let proto1 = P2Protocol::new(sender1);
         let proto2 = P2Protocol::new(sender2);
 
@@ -124,15 +125,15 @@ mod test {
         let msg = Message::Heartbeat;
         let msg2 = msg.clone();
 
-        tokio::time::timeout(Duration::from_secs(3), async move {
+        compio::time::timeout(Duration::from_secs(3), async move {
             let target = ep2.node_addr().await.unwrap();
             proto1.send_msg(ep1.clone(), target, msg).await.unwrap();
         })
         .await
         .unwrap();
 
-        let res = tokio::time::timeout(Duration::from_secs(3), async move {
-            let bmsg = msg_recv.recv().await.unwrap();
+        let res = compio::runtime::time::timeout(Duration::from_secs(3), async move {
+            let bmsg = msg_recv.next().await.unwrap();
             let signed_message: SignedMessage = postcard::from_bytes(&bmsg).unwrap();
             signed_message.data
         })

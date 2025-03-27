@@ -10,7 +10,7 @@ mod protocol;
 mod storage;
 mod utils;
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
     CliArgs::validate(&args)?;
