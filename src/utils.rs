@@ -50,8 +50,8 @@ pub struct CliArgs {
     pub primary: bool,
 
     /// Name of this node, used in dns resolving
-    #[arg(short, long, value_name = "NICKNAME", requires = "backend")]
-    pub alias: Option<String>,
+    #[arg(short = 'D', long, value_name = "NICKNAME", requires = "backend")]
+    pub domain: Option<String>,
 
     /// Use ticket string to join a existing network
     #[arg(short, long, value_name = "TICKET")]
@@ -81,7 +81,6 @@ pub struct CliArgs {
 }
 
 impl Ticket {
-    // TODO: don't use addr but node directly
     pub fn new(topic: Option<TopicId>, node: Node) -> Self {
         let rnum = rand::random::<[u8; 32]>().to_vec();
         let topic = topic.unwrap_or_else(|| TopicId::from_bytes(rand::random()));
@@ -209,7 +208,7 @@ impl From<NodeInfo> for WrappedNodeInfo {
 impl CliArgs {
     pub fn validate(args: &Self) -> Result<()> {
         if args
-            .alias
+            .domain
             .as_deref()
             .is_some_and(|s| s.len() >= UserData::MAX_LENGTH)
         {
@@ -339,7 +338,7 @@ pub fn output(ctx: Context) {
                 })
                 .map(|addr| addr.ip().to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
-            let alias = node.alias.clone();
+            let alias = node.domain.clone();
             let last_seen = format_duration(now - node.last_heartbeat);
             (addr, alias, last_seen)
         })

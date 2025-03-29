@@ -106,7 +106,7 @@ pub struct Node {
     pub node_id: NodeId,
     pub invitor: NodeId,
     pub(crate) addr: NodeAddr,
-    pub alias: String,
+    pub domain: String,
     pub services: BTreeMap<String, u32>,
     pub last_heartbeat: u64,
 }
@@ -182,8 +182,8 @@ pub async fn init_network(
         storage.save_config_trival::<u16>("bind_port", port)?;
         bind_addr = SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), 0);
     }
-
-    let alias = args.alias.clone().unwrap_or(
+    
+    let domain = args.domain.clone().unwrap_or(
         thread_rng()
             .sample_iter(&Alphanumeric)
             .take(6)
@@ -242,7 +242,7 @@ pub async fn init_network(
         node_id: pk,
         invitor: invitor.unwrap_or(pk),
         addr: endpoint.node_addr().await?,
-        alias,
+        domain,
         services: Default::default(), // reserved
         last_heartbeat: time_now(),
     };
@@ -357,7 +357,7 @@ pub async fn init_network(
 
     // for now, this takes no effect since we don't handle discovery events manually.
     endpoint.set_user_data_for_discovery(
-        args.alias
+        args.domain
             .clone()
             .map(|alias| UserData::from_str(alias.as_str()).unwrap()),
     );
@@ -395,7 +395,7 @@ impl Context {
                 let invited = Message::Invited {
                     topic: self.ticket.topic(),
                     rnum,
-                    alias: self.me.alias.clone(),
+                    alias: self.me.domain.clone(),
                     services: self.me.services.clone(),
                 };
                 if self.broadcast_message(invited).await.is_err() {
@@ -403,7 +403,7 @@ impl Context {
                 }
             }
             let about_me = Message::AboutMe {
-                alias: self.me.alias.clone(),
+                alias: self.me.domain.clone(),
                 services: self.me.services.clone(),
                 invitor: self.me.invitor,
             };
@@ -499,7 +499,7 @@ impl Context {
         for pair in self.nodes.iter() {
             let node = pair.value();
             by_alias
-                .entry(node.alias.clone())
+                .entry(node.domain.clone())
                 .and_modify(|(id, heartbeat)| {
                     if node.last_heartbeat > *heartbeat {
                         *id = node.node_id;
@@ -513,7 +513,7 @@ impl Context {
             let mut to_remove = Vec::new();
             for pair in self.nodes.iter() {
                 let node = pair.value();
-                if let Some((best_id, _)) = by_alias.get(&node.alias) {
+                if let Some((best_id, _)) = by_alias.get(&node.domain) {
                     if *best_id != node.node_id {
                         to_remove.push(node.node_id);
                     }
@@ -636,7 +636,7 @@ impl Context {
                     node_id: from,
                     invitor: self.me.node_id,
                     addr,
-                    alias,
+                    domain: alias,
                     services,
                     last_heartbeat: 0,
                 };
@@ -671,7 +671,7 @@ impl Context {
                     node_id: from,
                     invitor,
                     addr,
-                    alias,
+                    domain: alias,
                     services,
                     last_heartbeat: 0,
                 };
@@ -845,7 +845,7 @@ mod test {
             Self {
                 node_id: pk,
                 invitor: pk,
-                alias: String::default(),
+                domain: String::default(),
                 services: BTreeMap::new(),
                 last_heartbeat: 0,
                 addr: NodeAddr::from_parts(pk, None, vec![]),
