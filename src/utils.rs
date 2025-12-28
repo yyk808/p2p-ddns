@@ -1,11 +1,11 @@
 use core::fmt;
-use std::{fmt::Display, hash::Hash, str::FromStr, sync::Arc};
+use std::{fmt::Display, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Parser, builder::TypedValueParser};
-use iroh::node_info::{NodeInfo, UserData};
-use iroh_gossip::proto::TopicId;
+use iroh::discovery::UserData;
+use iroh_gossip::TopicId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -34,9 +34,6 @@ pub enum LogLevel {
     Error,
     Off,
 }
-
-#[derive(Debug, Clone)]
-pub struct WrappedNodeInfo(pub NodeInfo);
 
 #[derive(Debug, Default, Clone, Parser)]
 #[command(version, about, long_about = None)]
@@ -69,7 +66,7 @@ pub struct CliArgs {
         value_parser = clap::builder::PossibleValuesParser::new(["trace", "debug", "info", "warn", "error", "off"])
             .map(|s| s.parse::<LogLevel>().unwrap()),
     )]
-    log: LogLevel,
+    pub log: LogLevel,
 
     #[arg(long, short = 'B', value_name = "BIND_ADDR")]
     pub bind: Option<String>,
@@ -184,27 +181,6 @@ impl Display for LogLevel {
     }
 }
 
-impl Hash for WrappedNodeInfo {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.node_id.hash(state);
-        self.0.direct_addresses().hash(state);
-    }
-}
-
-impl PartialEq for WrappedNodeInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.node_id == other.0.node_id && self.0.direct_addresses() == other.0.direct_addresses()
-    }
-}
-
-impl Eq for WrappedNodeInfo {}
-
-impl From<NodeInfo> for WrappedNodeInfo {
-    fn from(node: NodeInfo) -> Self {
-        Self(node)
-    }
-}
-
 impl CliArgs {
     pub fn validate(args: &Self) -> Result<()> {
         if args
@@ -229,9 +205,10 @@ impl CliArgs {
     }
 
     pub fn apply(&self) {
-        env_logger::Builder::new()
-            .filter(Some("p2p_ddns2"), self.log.into())
-            .init();
+        // Logger initialization moved to main() to avoid double initialization
+        // env_logger::Builder::new()
+        //     .filter(Some("p2p_ddns2"), self.log.into())
+        //     .init();
     }
 }
 
@@ -331,8 +308,7 @@ pub fn output(ctx: Context) {
             // find out the first addr start with 10.xxx or 192.168.xxx
             let addr = node
                 .addr
-                .direct_addresses
-                .iter()
+                .ip_addrs()
                 .find(|addr| {
                     addr.is_ipv4() && !addr.ip().is_loopback() && !addr.ip().is_multicast()
                 })

@@ -1,7 +1,11 @@
 use anyhow::Result;
 use bytes::Bytes;
-use futures::{channel::mpsc::Sender, future::BoxFuture, SinkExt};
-use iroh::{Endpoint, NodeAddr, endpoint::RecvStream, protocol::ProtocolHandler};
+use futures::{SinkExt, channel::mpsc::Sender};
+use iroh::{
+    Endpoint, EndpointAddr,
+    endpoint::{Connection, RecvStream},
+    protocol::{AcceptError, ProtocolHandler},
+};
 
 use crate::network::{Message, SignedMessage};
 
@@ -20,7 +24,7 @@ impl P2Protocol {
     pub async fn send_msg(
         &self,
         ep: Endpoint,
-        target: impl Into<NodeAddr>,
+        target: impl Into<EndpointAddr>,
         msg: Message,
     ) -> Result<()> {
         let conn = ep.connect(target, P2Protocol::P2P_ALPN).await?;
@@ -46,8 +50,8 @@ impl P2Protocol {
         Ok(buffer.into())
     }
 
-    async fn handle_connection(&self, conn: iroh::endpoint::Connecting) -> Result<()> {
-        let mut recv = conn.await?.accept_uni().await?;
+    async fn handle_connection(&self, conn: Connection) -> Result<()> {
+        let mut recv = conn.accept_uni().await?;
         let msg = Self::recv_msg(&mut recv).await?;
         self.msg_sender.clone().send(msg).await?;
         Ok(())
@@ -57,16 +61,16 @@ impl P2Protocol {
 impl ProtocolHandler for P2Protocol {
     fn accept(
         &self,
-        conn: iroh::endpoint::Connecting,
-    ) -> BoxFuture<'static, Result<()>> {
+        conn: Connection,
+    ) -> impl std::future::Future<Output = Result<(), AcceptError>> + Send {
         let proto = self.clone();
-        Box::pin(async move {
+        async move {
             log::debug!("Accepting connection in p2p protocol");
             if let Err(e) = proto.handle_connection(conn).await {
                 log::error!("Failed to handle connection in p2p protocol: {}", e);
             }
             Ok(())
-        })
+        }
     }
 }
 
@@ -77,9 +81,10 @@ mod test {
     use super::*;
 
     use futures::StreamExt;
-    use iroh::{RelayMode, endpoint::Endpoint, protocol::Router};
+    use iroh::{Endpoint, RelayMode, protocol::RouterBuilder};
 
-    #[compio::test]
+    #[tokio::test]
+    #[ignore = "requires UDP socket binding permissions"]
     async fn test_p2p_protocol() {
         env_logger::init();
         let (sender1, _) = futures::channel::mpsc::channel(1);
@@ -89,50 +94,41 @@ mod test {
 
         let ep1 = Endpoint::builder()
             .relay_mode(RelayMode::Disabled)
-            .discovery_local_network()
             .bind()
             .await
             .unwrap();
 
-        Router::builder(ep1.clone())
+        let _router1 = RouterBuilder::new(ep1.clone())
             .accept(P2Protocol::P2P_ALPN, proto1.clone())
-            .spawn()
-            .await
-            .unwrap();
+            .spawn();
 
         let ep2 = Endpoint::builder()
             .relay_mode(RelayMode::Disabled)
-            .discovery_local_network()
             .bind()
             .await
             .unwrap();
 
-        Router::builder(ep2.clone())
+        let _router2 = RouterBuilder::new(ep2.clone())
             .accept(P2Protocol::P2P_ALPN, proto2)
-            .spawn()
-            .await
-            .unwrap();
+            .spawn();
 
-        let addr1 = ep1.node_addr().await.unwrap();
-        let addr2 = ep2.node_addr().await.unwrap();
+        let addr1 = ep1.addr();
+        let addr2 = ep2.addr();
 
         eprintln!("addr1: {:?}", addr1);
         eprintln!("addr2: {:?}", addr2);
 
-        ep1.add_node_addr(addr2).unwrap();
-        ep2.add_node_addr(addr1).unwrap();
-
         let msg = Message::Heartbeat;
         let msg2 = msg.clone();
 
-        compio::time::timeout(Duration::from_secs(3), async move {
-            let target = ep2.node_addr().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            let target = ep2.addr();
             proto1.send_msg(ep1.clone(), target, msg).await.unwrap();
         })
         .await
         .unwrap();
 
-        let res = compio::runtime::time::timeout(Duration::from_secs(3), async move {
+        let res = tokio::time::timeout(Duration::from_secs(3), async move {
             let bmsg = msg_recv.next().await.unwrap();
             let signed_message: SignedMessage = postcard::from_bytes(&bmsg).unwrap();
             signed_message.data

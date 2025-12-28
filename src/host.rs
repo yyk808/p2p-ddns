@@ -156,17 +156,13 @@ impl HostsBuilder {
                 // the location depends on the environment variable %WinDir%.
                 format!(
                     "{}\\System32\\Drivers\\Etc\\hosts",
-                    std::env::var("WinDir").map_err(|_| io::Error::new(
-                        ErrorKind::Other,
+                    std::env::var("WinDir").map_err(|_| io::Error::other(
                         "WinDir environment variable missing".to_owned()
                     ))?
                 ),
             )
         } else {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                "unsupported operating system.".to_owned(),
-            ));
+            return Err(io::Error::other("unsupported operating system.".to_owned()));
         };
 
         if !hosts_file.exists() {
@@ -263,10 +259,10 @@ impl HostsBuilder {
             }
             (None, None) => {
                 // Insert a blank line before a new section.
-                if let Some(last_line) = lines.iter().last() {
-                    if !last_line.is_empty() {
-                        lines.push("".to_string());
-                    }
+                if let Some(last_line) = lines.iter().last()
+                    && !last_line.is_empty()
+                {
+                    lines.push("".to_string());
                 }
                 lines.len()
             }

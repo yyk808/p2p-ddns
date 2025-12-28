@@ -1,8 +1,7 @@
 use std::{
-    cmp::max,
     collections::BTreeMap,
     hash::Hash,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -10,26 +9,20 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
-use compio::runtime::time::{interval, timeout};
 use dashmap::DashMap;
-use ed25519::Signature;
-use futures::{channel::mpsc::Receiver, StreamExt, FutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, channel::mpsc::Receiver};
 use iroh::{
-    Endpoint, NodeAddr, NodeId, PublicKey, SecretKey,
-    discovery::{
-        ConcurrentDiscovery, DiscoveryItem, local_swarm_discovery::LocalSwarmDiscovery,
-        static_provider::StaticProvider,
-    },
-    node_info::{NodeData, NodeInfo, UserData},
-    protocol::Router,
+    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey, Signature,
+    discovery::{UserData, mdns::MdnsDiscovery, static_provider::StaticProvider},
+    protocol::{Router, RouterBuilder},
 };
 use iroh_gossip::{
-    ALPN,
-    net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender},
-    proto::TopicId,
+    ALPN, Gossip, TopicId,
+    api::{Event, GossipReceiver, GossipSender},
 };
-use rand::{Rng, distributions::Alphanumeric, thread_rng};
+use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
+use tokio::time::{interval, timeout};
 
 use crate::{
     protocol::P2Protocol,
@@ -37,7 +30,6 @@ use crate::{
     utils::{CliArgs, Ticket, output, time_now},
 };
 
-pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/0";
 pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,10 +43,10 @@ pub enum Message {
     AboutMe {
         alias: String,
         services: BTreeMap<String, u32>,
-        invitor: NodeId,
+        invitor: EndpointId,
     },
     Introduce {
-        invited: NodeId,
+        invited: EndpointId,
     },
     SyncRequest {
         nodes: Vec<Node>,
@@ -68,7 +60,7 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SignedMessage {
-    pub(crate) from: NodeId,
+    pub(crate) from: EndpointId,
     pub(crate) data: Bytes,
     signature: Signature,
     timestamp: u64,
@@ -103,9 +95,9 @@ impl SignedMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
-    pub node_id: NodeId,
-    pub invitor: NodeId,
-    pub(crate) addr: NodeAddr,
+    pub node_id: EndpointId,
+    pub invitor: EndpointId,
+    pub(crate) addr: EndpointAddr,
     pub domain: String,
     pub services: BTreeMap<String, u32>,
     pub last_heartbeat: u64,
@@ -113,7 +105,7 @@ pub struct Node {
 
 #[derive(Debug, Clone)]
 pub struct Auth {
-    pub introducer: NodeId,
+    pub introducer: EndpointId,
     pub introduced: bool,
     pub node: Option<Box<Node>>,
     pub timestamp: u64,
@@ -128,11 +120,11 @@ pub struct Context {
     pub gossip: Gossip,
     pub single_point: P2Protocol,
     pub ticket: Ticket,
-    pub nodes: DashMap<NodeId, Node>,
+    pub nodes: DashMap<EndpointId, Node>,
     pub me: Arc<Node>,
     pub sender: GossipSender,
     pub args: CliArgs,
-    pub pending_auth: DashMap<NodeId, Auth>,
+    pub pending_auth: DashMap<EndpointId, Auth>,
 }
 
 impl Hash for Node {
@@ -182,23 +174,27 @@ pub async fn init_network(
         storage.save_config_trival::<u16>("bind_port", port)?;
         bind_addr = SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), 0);
     }
-    
-    let domain = args.domain.clone().unwrap_or(
-        thread_rng()
-            .sample_iter(&Alphanumeric)
+
+    let domain = args.domain.clone().unwrap_or_else(|| {
+        let rng = rand::rng();
+        rng.sample_iter(&Alphanumeric)
             .take(6)
             .map(char::from)
-            .collect(),
-    );
+            .collect()
+    });
 
     // Try to load the secret key from storage, if not found, generate a new one.
     // The public key is used as the node ID to be acknowledged by other nodes.
-    let (pk, sk) = storage.load_secret()?.unwrap_or_else(#[inline]|| {
-        let sk = SecretKey::generate(rand::rngs::OsRng);
-        let pk = sk.public();
-        storage.save_secret(sk.clone()).unwrap();
-        (pk, sk)
-    });
+    let (pk, sk) = storage.load_secret()?.unwrap_or_else(
+        #[inline]
+        || {
+            let mut rng = rand::rng();
+            let sk = SecretKey::generate(&mut rng);
+            let pk = sk.public();
+            storage.save_secret(sk.clone()).unwrap();
+            (pk, sk)
+        },
+    );
 
     // Set up bootstrap nodes with ticket and storage
     let arg_ticket = Ticket::from_str(args.ticket.as_deref().unwrap_or(""));
@@ -209,39 +205,32 @@ pub async fn init_network(
         .unwrap_or((None, None, None, None));
 
     // Set up discovery:
-    // 1. Local discovery - only for daemon mode
-    // 2. Static discovery - always
-    let mut discoveries = ConcurrentDiscovery::empty();
-
-    let local_discovery = LocalSwarmDiscovery::new(pk).unwrap();
-    discoveries.add(local_discovery);
-
+    // - Local discovery (mDNS) is enabled only in daemon mode
+    // - Static discovery is always enabled (for tickets / persisted nodes)
     let sp = StaticProvider::new();
-    discoveries.add(sp.clone());
-
-    // TODO: dynamic ALPN name
-    // endpoint-protocol(gossip)-router are iroh components
-    let endpoint = Endpoint::builder()
-        .relay_mode(iroh::RelayMode::Disabled)
+    let mut endpoint_builder = Endpoint::builder()
+        .relay_mode(RelayMode::Disabled)
         .secret_key(sk)
         .bind_addr_v4(bind_addr)
-        .add_discovery(|_| Some(discoveries))
-        .alpns([ALPN.into()].into())
-        .bind()
-        .await?;
+        .discovery(sp.clone());
+
+    if args.daemon {
+        endpoint_builder = endpoint_builder.discovery(MdnsDiscovery::builder());
+    }
+
+    let endpoint = endpoint_builder.bind().await?;
 
     let (msg_sender, msg_receiver) = futures::channel::mpsc::channel(1024);
-    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
+    let gossip = Gossip::builder().spawn(endpoint.clone());
     let p2p = P2Protocol::new(msg_sender);
-    let router = Router::builder(endpoint.clone())
-        .accept(GOSSIP_ALPN, gossip.clone())
+    let router = RouterBuilder::new(endpoint.clone())
+        .accept(ALPN, gossip.clone())
         .accept(P2P_ALPN, p2p.clone())
-        .spawn()
-        .await?;
+        .spawn();
     let me = Node {
         node_id: pk,
         invitor: invitor.unwrap_or(pk),
-        addr: endpoint.node_addr().await?,
+        addr: endpoint.addr(),
         domain,
         services: Default::default(), // reserved
         last_heartbeat: time_now(),
@@ -273,65 +262,32 @@ pub async fn init_network(
         .load_nodes::<Vec<_>>()?
         .into_iter()
         .map(|node| (node.node_id, node))
-        .collect::<DashMap<NodeId, Node>>();
+        .collect::<DashMap<EndpointId, Node>>();
 
     // Setting up static discovery with storage
     bootstrap_nodes.iter().for_each(|node| {
-        let info = NodeInfo {
-            node_id: node.node_id,
-            data: NodeData::from(node.addr.clone()),
-        };
-        sp.add_node_info(info);
+        sp.add_endpoint_info(node.addr.clone());
     });
 
     // Setting up static discovery with ticket
     if let Some(node) = invitor_node {
-        sp.set_node_info(NodeInfo::from_parts(
-            node.node_id,
-            NodeData::from(node.addr.clone()),
-        ));
+        sp.set_endpoint_info(node.addr.clone());
         bootstrap_nodes.insert(node.node_id, node);
     }
 
-
-    fn update_bootstrap(endpoint: Endpoint, bootstrap_nodes: &DashMap<NodeId, Node>) {
-        endpoint.remote_info_iter().for_each(|info| {
-            let now = time_now();
-            let iroh_timestamp = now - info.last_used.map_or(0, |t| t.as_secs());
-            let should_update = {
-                let target = bootstrap_nodes.get(&info.node_id);
-                target.is_none()
-                    || target
-                        .as_ref()
-                        .is_some_and(|t| t.last_heartbeat < iroh_timestamp + 10)
-            };
-            if should_update {
-                let last_heartbeat = info.last_used.map_or(0, |t| t.as_secs());
-                let id = info.node_id;
-                let addr = NodeAddr::from(info);
-                bootstrap_nodes.alter(&id, |_, mut v| {
-                    v.addr = addr;
-                    v.last_heartbeat = last_heartbeat;
-                    v
-                });
-            }
-        })
+    fn load_bootstrap(bootstrap_nodes: &DashMap<EndpointId, Node>) -> Vec<EndpointId> {
+        bootstrap_nodes.iter().map(|node| node.node_id).collect()
     }
 
-    fn load_bootstrap (bootstrap_nodes: &DashMap<PublicKey, Node>) -> Vec<NodeId> {
-        bootstrap_nodes
-            .iter()
-            .map(|node| node.addr.node_id)
-            .collect::<Vec<_>>()
-    }
-
-    update_bootstrap(endpoint.clone(), &bootstrap_nodes);
     if !args.primary && load_bootstrap(&bootstrap_nodes).is_empty() {
         log::warn!("No bootstrap nodes found, add one with ticket or waiting for mdns discovery");
     }
 
     let (sender, receiver) = if args.primary {
-        gossip.subscribe(ticket.topic(), load_bootstrap(&bootstrap_nodes))?.split()
+        gossip
+            .subscribe(ticket.topic(), load_bootstrap(&bootstrap_nodes))
+            .await?
+            .split()
     } else {
         let mut retry = 1u8;
         loop {
@@ -348,7 +304,6 @@ pub async fn init_network(
                 Ok(Ok(res)) => break res.split(),
                 _ => {
                     log::warn!("Timeout joining gossip, retrying {} times...", retry);
-                    update_bootstrap(endpoint.clone(), &bootstrap_nodes);
                     retry += 1;
                 }
             }
@@ -387,7 +342,6 @@ impl Context {
         rnum: Option<Vec<u8>>,
     ) {
         let mut cron_jobs = interval(std::time::Duration::from_secs(30));
-        let mut discovery = self.handle.discovery_stream();
 
         // before join the loop, we still need to broadcast some message to bootstrap ourself.
         if self.args.daemon {
@@ -419,9 +373,8 @@ impl Context {
         };
         let _ = self.broadcast_neighbor_message(sync_req).await;
 
-
         loop {
-            let mut ctrlc = compio::signal::ctrl_c().fuse();
+            let ctrlc = tokio::signal::ctrl_c().fuse();
             let ctrlc = std::pin::pin!(ctrlc);
 
             futures::select! {
@@ -441,10 +394,6 @@ impl Context {
                     if let Err(e) = self.save().await {
                         log::error!("Failed to save nodes to storage: {:?}", e);
                     }
-                },
-                item = discovery.try_next().fuse() => {
-                    log::trace!("Received discovery item: {:?}", item);
-                    self.process_discovery(item.map_err(|lag| anyhow::anyhow!("Lagging discovery: {}", lag))).await;
                 },
                 bmsg = sp_recv.next().fuse() => {
                     if let Some(bmsg) = bmsg {
@@ -494,7 +443,7 @@ impl Context {
 
         // Clean up nodes that have the same alias name.
         // Find nodes with duplicate aliases, keeping only the most recent one
-        let mut by_alias: std::collections::HashMap<String, (NodeId, u64)> =
+        let mut by_alias: std::collections::HashMap<String, (EndpointId, u64)> =
             std::collections::HashMap::new();
         for pair in self.nodes.iter() {
             let node = pair.value();
@@ -513,10 +462,10 @@ impl Context {
             let mut to_remove = Vec::new();
             for pair in self.nodes.iter() {
                 let node = pair.value();
-                if let Some((best_id, _)) = by_alias.get(&node.domain) {
-                    if *best_id != node.node_id {
-                        to_remove.push(node.node_id);
-                    }
+                if let Some((best_id, _)) = by_alias.get(&node.domain)
+                    && *best_id != node.node_id
+                {
+                    to_remove.push(node.node_id);
                 }
             }
             to_remove
@@ -531,30 +480,6 @@ impl Context {
     }
 
     pub async fn update_nodes(&self) {
-        for info in self.handle.remote_info_iter() {
-            let id = info.node_id;
-
-            // we don't care the node not in self.nodes, since it's authenticated.
-            if self.nodes.contains_key(&id) {
-                self.nodes.alter(&id, |_, mut node| {
-                    // update heartbeat timestamp
-                    let now = time_now();
-                    let iroh_timestamp = now - info.last_used.map_or(0, |t| t.as_secs());
-                    let local_timestamp = node.last_heartbeat;
-                    node.last_heartbeat = max(iroh_timestamp, local_timestamp);
-
-                    // update ip addresses
-                    info.addrs.iter().for_each(|addr| {
-                        if !node.addr.direct_addresses.contains(&addr.addr) {
-                            node.addr.direct_addresses.insert(addr.addr);
-                        }
-                    });
-
-                    node
-                });
-            }
-        }
-
         let nodes = self
             .nodes
             .iter()
@@ -566,33 +491,28 @@ impl Context {
             .await;
     }
 
-    async fn process_discovery(&self, _item: Result<Option<DiscoveryItem>>) {}
-
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
         match evt {
             Ok(Some(evt)) => match evt {
-                Event::Gossip(gossip_event) => match gossip_event {
-                    GossipEvent::NeighborDown(public_key) => {
-                        // self.nodes.remove(&public_key);
-                        self.pending_auth.remove(&public_key);
+                Event::NeighborDown(endpoint_id) => {
+                    self.pending_auth.remove(&endpoint_id);
+                }
+                Event::Received(msg) => {
+                    if let Ok((from, message, passed)) =
+                        SignedMessage::decode_and_verify(self.clone(), msg.content)
+                    {
+                        self.process_message(from, message, passed).await;
                     }
-                    GossipEvent::Received(bmsg) => {
-                        if let Ok((from, msg, passed)) =
-                            SignedMessage::decode_and_verify(self.clone(), bmsg.content)
-                        {
-                            self.process_message(from, msg, passed).await;
-                        }
-                    }
-                    _ => {}
-                },
-                Event::Lagged => log::warn!("Gossip network is lagged"),
+                }
+                Event::Lagged => log::warn!("Gossip receiver lagged; consider restarting it"),
+                Event::NeighborUp(_) => {}
             },
             Err(e) => log::error!("Error processing gossip event: {:?}", e),
             _ => {}
         }
     }
 
-    async fn process_message(&self, from: NodeId, message: Message, passed: bool) {
+    async fn process_message(&self, from: EndpointId, message: Message, passed: bool) {
         log::debug!("Received message from {:?}", from);
         log::debug!("Message: {:?}", message);
 
@@ -617,20 +537,7 @@ impl Context {
                     log::info!("Trusting node: {:?} for it holds our ticket", from);
                 }
 
-                let addr = if let Some(info) = self.handle.remote_info(from) {
-                    // We have no relay for sure.
-                    NodeAddr::from_parts(
-                        from,
-                        None,
-                        info.addrs
-                            .iter()
-                            .map(|addr| addr.addr)
-                            .collect::<Vec<SocketAddr>>(),
-                    )
-                } else {
-                    log::error!("No remote info for node: {:?}", from);
-                    return;
-                };
+                let addr = EndpointAddr::new(from);
 
                 let node = Node {
                     node_id: from,
@@ -652,20 +559,7 @@ impl Context {
                 services,
                 invitor,
             } => {
-                let addr = if let Some(info) = self.handle.remote_info(from) {
-                    // We have no relay for sure.
-                    NodeAddr::from_parts(
-                        from,
-                        None,
-                        info.addrs
-                            .iter()
-                            .map(|addr| addr.addr)
-                            .collect::<Vec<SocketAddr>>(),
-                    )
-                } else {
-                    log::error!("No remote info for node: {:?}", from);
-                    return;
-                };
+                let addr = EndpointAddr::new(from);
 
                 let node = Node {
                     node_id: from,
@@ -815,7 +709,7 @@ impl Context {
         Ok(())
     }
 
-    pub async fn send_message_to(&self, id: &NodeId, message: Message) -> Result<()> {
+    pub async fn send_message_to(&self, id: &EndpointId, message: Message) -> Result<()> {
         if id == &self.me.node_id {
             return Ok(());
         }
@@ -828,7 +722,7 @@ impl Context {
         Ok(())
     }
 
-    pub fn is_node_trusted(&self, id: &NodeId) -> bool {
+    pub fn is_node_trusted(&self, id: &EndpointId) -> bool {
         self.nodes.contains_key(id)
     }
 }
@@ -839,7 +733,8 @@ mod test {
 
     impl Node {
         pub fn random_node() -> Self {
-            let sk = SecretKey::generate(rand::rngs::OsRng);
+            let mut rng = rand::rng();
+            let sk = SecretKey::generate(&mut rng);
             let pk = sk.public();
 
             Self {
@@ -848,7 +743,7 @@ mod test {
                 domain: String::default(),
                 services: BTreeMap::new(),
                 last_heartbeat: 0,
-                addr: NodeAddr::from_parts(pk, None, vec![]),
+                addr: EndpointAddr::new(pk),
             }
         }
     }

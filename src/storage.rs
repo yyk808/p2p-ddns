@@ -1,8 +1,9 @@
 use anyhow::Result;
-use iroh::{NodeId, PublicKey, SecretKey};
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+use iroh::{EndpointId, PublicKey, SecretKey};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
-use std::{fs::File, path::Path, str::FromStr, sync::Arc};
+use std::{fs::File, path::Path, sync::Arc};
 
 use crate::{network::Node, utils::CliArgs};
 
@@ -17,13 +18,13 @@ pub struct Storage {
 
 #[allow(dead_code)]
 impl Storage {
-    pub fn new<P: AsRef<Path>>(file_path: P) -> Result<Self, redb::Error> {
+    pub fn new<P: AsRef<Path>>(file_path: P) -> Result<Self> {
         let db = Database::create(file_path)?;
         let db = Arc::new(db);
         Ok(Self { db })
     }
 
-    pub fn load_nodes<T>(&self) -> Result<T, redb::Error>
+    pub fn load_nodes<T>(&self) -> Result<T>
     where
         T: Default + IntoIterator<Item = Node> + FromIterator<Node>,
     {
@@ -51,7 +52,7 @@ impl Storage {
         }
     }
 
-    pub fn save_node(&self, node: &Node) -> Result<(), redb::Error> {
+    pub fn save_node(&self, node: &Node) -> Result<()> {
         let write_txn = self.db.begin_write()?;
 
         {
@@ -66,7 +67,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn batch_save_nodes<I, T>(&self, node_iter: I) -> Result<(), redb::Error>
+    pub fn batch_save_nodes<I, T>(&self, node_iter: I) -> Result<()>
     where
         I: IntoIterator<Item = T>,
         T: Into<Node>,
@@ -88,7 +89,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn remove_node(&self, peer_id: &NodeId) -> Result<(), redb::Error> {
+    pub fn remove_node(&self, peer_id: &EndpointId) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(TABLE)?;
@@ -101,14 +102,14 @@ impl Storage {
         Ok(())
     }
 
-    pub fn save_secret(&self, sk: SecretKey) -> Result<(), redb::Error> {
+    pub fn save_secret(&self, sk: SecretKey) -> Result<()> {
         // TODO: save secret encrypted?
         let write_txn = self.db.begin_write()?;
 
         {
             let mut table = write_txn.open_table(SECRERT)?;
 
-            let sks = sk.to_string();
+            let sks = STANDARD_NO_PAD.encode(sk.to_bytes());
             let _ = table.insert("sk", sks.as_str())?;
         }
 
@@ -116,7 +117,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn load_secret(&self) -> Result<Option<(PublicKey, SecretKey)>, redb::Error> {
+    pub fn load_secret(&self) -> Result<Option<(PublicKey, SecretKey)>> {
         let read_txn = self.db.begin_read()?;
 
         let table = match read_txn.open_table(SECRERT) {
@@ -127,7 +128,9 @@ impl Storage {
         let sk = table.get("sk")?;
 
         if let Some(sk) = sk {
-            let sk = SecretKey::from_str(sk.value()).unwrap();
+            let decoded = STANDARD_NO_PAD.decode(sk.value()).unwrap();
+            let bytes: [u8; 32] = decoded.as_slice().try_into().unwrap();
+            let sk = SecretKey::from_bytes(&bytes);
             let pk = sk.public();
             Ok(Some((pk, sk)))
         } else {
@@ -135,7 +138,7 @@ impl Storage {
         }
     }
 
-    pub fn save_config<W, T>(&self, key: &str, value: W) -> Result<(), redb::Error>
+    pub fn save_config<W, T>(&self, key: &str, value: W) -> Result<()>
     where
         W: AsRef<T>,
         T: Serialize,
@@ -152,7 +155,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn save_config_trival<T>(&self, key: &str, value: T) -> Result<(), redb::Error>
+    pub fn save_config_trival<T>(&self, key: &str, value: T) -> Result<()>
     where
         T: Serialize + Copy,
     {
@@ -167,7 +170,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn load_config<T>(&self, key: &str) -> Result<Option<T>, redb::Error>
+    pub fn load_config<T>(&self, key: &str) -> Result<Option<T>>
     where
         T: for<'a> serde::Deserialize<'a>,
     {
@@ -188,7 +191,7 @@ impl Storage {
         }
     }
 
-    pub fn remove_config(&self, key: &str) -> Result<(), redb::Error> {
+    pub fn remove_config(&self, key: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(CONFIG)?;
@@ -200,7 +203,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn clear(&self) -> Result<(), redb::Error> {
+    pub fn clear(&self) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             write_txn.delete_table(TABLE)?;
@@ -268,7 +271,8 @@ mod test {
         let fd = tempfile().expect("Failed to create temp file");
         let storage = Storage::try_from(fd).unwrap();
 
-        let sk = SecretKey::generate(rand::rngs::OsRng);
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
         let pk = sk.public();
         storage.save_secret(sk.clone()).unwrap();
 
