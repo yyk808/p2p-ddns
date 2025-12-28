@@ -76,7 +76,10 @@ impl ProtocolHandler for P2Protocol {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -84,9 +87,8 @@ mod test {
     use iroh::{Endpoint, RelayMode, protocol::RouterBuilder};
 
     #[tokio::test]
-    #[ignore = "requires UDP socket binding permissions"]
     async fn test_p2p_protocol() {
-        env_logger::init();
+        let _ = env_logger::builder().is_test(true).try_init();
         let (sender1, _) = futures::channel::mpsc::channel(1);
         let (sender2, mut msg_recv) = futures::channel::mpsc::channel(1);
         let proto1 = P2Protocol::new(sender1);
@@ -94,6 +96,8 @@ mod test {
 
         let ep1 = Endpoint::builder()
             .relay_mode(RelayMode::Disabled)
+            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
             .bind()
             .await
             .unwrap();
@@ -104,6 +108,8 @@ mod test {
 
         let ep2 = Endpoint::builder()
             .relay_mode(RelayMode::Disabled)
+            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
             .bind()
             .await
             .unwrap();

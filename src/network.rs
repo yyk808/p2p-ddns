@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -10,8 +10,10 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{FutureExt, StreamExt, TryStreamExt, channel::mpsc::Receiver};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey, TransportAddr,
-    discovery::{UserData, mdns::MdnsDiscovery, static_provider::StaticProvider},
+    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey,
+    discovery::{
+        UserData, mdns::MdnsDiscovery, pkarr::dht::DhtDiscovery, static_provider::StaticProvider,
+    },
     protocol::{Router, RouterBuilder},
 };
 use iroh_gossip::{
@@ -57,17 +59,6 @@ pub async fn init_network(
         storage.clear()?;
     }
 
-    let bind_addr;
-    if let Some(bind) = &args.bind {
-        bind_addr = bind.parse::<SocketAddrV4>()?;
-    } else if let Ok(Some(port)) = storage.load_config::<u16>("bind_port") {
-        bind_addr = SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), port);
-    } else {
-        let port = rand::random::<u16>();
-        storage.save_config_trival::<u16>("bind_port", port)?;
-        bind_addr = SocketAddrV4::new(Ipv4Addr::from_str("0.0.0.0").unwrap(), 0);
-    }
-
     let domain = args.domain.clone().unwrap_or_else(|| {
         let rng = rand::rng();
         rng.sample_iter(&Alphanumeric)
@@ -104,14 +95,53 @@ pub async fn init_network(
     let mut endpoint_builder = Endpoint::builder()
         .relay_mode(RelayMode::Disabled)
         .secret_key(sk)
-        .bind_addr_v4(bind_addr)
         .discovery(sp.clone());
+
+    if let Some(bind) = &args.bind {
+        let bind: SocketAddr = bind.parse()?;
+        match bind {
+            SocketAddr::V4(v4) => {
+                endpoint_builder = endpoint_builder.bind_addr_v4(v4);
+                if v4.ip().is_loopback() {
+                    endpoint_builder = endpoint_builder.bind_addr_v6(SocketAddrV6::new(
+                        Ipv6Addr::LOCALHOST,
+                        v4.port(),
+                        0,
+                        0,
+                    ));
+                }
+            }
+            SocketAddr::V6(v6) => {
+                endpoint_builder = endpoint_builder.bind_addr_v6(v6);
+                if v6.ip().is_loopback() {
+                    endpoint_builder = endpoint_builder
+                        .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, v6.port()));
+                }
+            }
+        }
+    } else if let Ok(Some(port)) = storage.load_config::<u16>("bind_port") {
+        endpoint_builder = endpoint_builder
+            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+            .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+    } else {
+        let port = rand::random::<u16>();
+        storage.save_config_trival::<u16>("bind_port", port)?;
+        endpoint_builder = endpoint_builder
+            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+            .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+    }
 
     if args.daemon && !args.no_mdns {
         endpoint_builder = endpoint_builder.discovery(MdnsDiscovery::builder());
     }
 
+    if args.dht {
+        endpoint_builder =
+            endpoint_builder.discovery(DhtDiscovery::builder().include_direct_addresses(true));
+    }
+
     let endpoint = endpoint_builder.bind().await?;
+    let endpoint_addr = wait_for_non_empty_addr(&endpoint).await;
 
     let (msg_sender, msg_receiver) = futures::channel::mpsc::channel(1024);
     let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -120,14 +150,16 @@ pub async fn init_network(
         .accept(ALPN, gossip.clone())
         .accept(P2P_ALPN, p2p.clone())
         .spawn();
-    let me = Node {
+    let mut me = Node {
         node_id: pk,
         invitor: invitor.unwrap_or(pk),
-        addr: EndpointAddr::from_parts(pk, [TransportAddr::Ip(SocketAddr::V4(bind_addr))]),
+        addr: EndpointAddr::new(pk),
         domain,
         services: Default::default(), // reserved
         last_heartbeat: time_now(),
     };
+    // Prefer the endpoint's current view of our reachable addresses.
+    me.addr = endpoint_addr;
     log::debug!("My node: {:?}", me);
 
     // Generate a ticket for ourself.
@@ -228,6 +260,20 @@ pub async fn init_network(
     Ok((context, receiver, msg_receiver, invitor_rnum))
 }
 
+async fn wait_for_non_empty_addr(endpoint: &Endpoint) -> EndpointAddr {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let addr = endpoint.addr();
+        if addr.ip_addrs().next().is_some() {
+            return addr;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return addr;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 impl Context {
     fn decode_and_verify(&self, bytes: Bytes) -> Result<(PublicKey, Message, bool)> {
         let signed = SignedMessage::decode(bytes)?;
@@ -257,7 +303,7 @@ impl Context {
                 let invited = Message::Invited {
                     topic: self.ticket.topic(),
                     rnum,
-                    addr: self.me.addr.clone(),
+                    addr: self.handle.addr(),
                     alias: self.me.domain.clone(),
                     services: self.me.services.clone(),
                 };
@@ -266,7 +312,7 @@ impl Context {
                 }
             }
             let about_me = Message::AboutMe {
-                addr: self.me.addr.clone(),
+                addr: self.handle.addr(),
                 alias: self.me.domain.clone(),
                 services: self.me.services.clone(),
                 invitor: self.me.invitor,
@@ -338,7 +384,7 @@ impl Context {
                 let invited = Message::Invited {
                     topic: self.ticket.topic(),
                     rnum,
-                    addr: self.me.addr.clone(),
+                    addr: self.handle.addr(),
                     alias: self.me.domain.clone(),
                     services: self.me.services.clone(),
                 };
@@ -346,7 +392,7 @@ impl Context {
             }
 
             let about_me = Message::AboutMe {
-                addr: self.me.addr.clone(),
+                addr: self.handle.addr(),
                 alias: self.me.domain.clone(),
                 services: self.me.services.clone(),
                 invitor: self.me.invitor,
@@ -359,11 +405,15 @@ impl Context {
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = cron_jobs.tick() => {
                     if self.args.daemon {
+                        let mut me = (*self.me).clone();
+                        me.addr = self.handle.addr();
+                        me.last_heartbeat = time_now();
+
                         let nodes = self
                             .nodes
                             .iter()
                             .map(|it| it.value().clone())
-                            .chain([self.me.as_ref().clone()])
+                            .chain([me])
                             .collect::<Vec<_>>();
                         let _ = self.broadcast_neighbor_message(Message::SyncRequest { nodes }).await;
                     }
@@ -417,50 +467,30 @@ impl Context {
         self.pending_auth
             .retain(|_, auth| now - auth.timestamp < 60 * 5);
 
-        // Clean up nodes that have the same alias name.
-        // Find nodes with duplicate aliases, keeping only the most recent one
-        let mut by_alias: std::collections::HashMap<String, (EndpointId, u64)> =
-            std::collections::HashMap::new();
-        for pair in self.nodes.iter() {
-            let node = pair.value();
-            by_alias
-                .entry(node.domain.clone())
-                .and_modify(|(id, heartbeat)| {
-                    if node.last_heartbeat > *heartbeat {
-                        *id = node.node_id;
-                        *heartbeat = node.last_heartbeat;
-                    }
-                })
-                .or_insert((node.node_id, node.last_heartbeat));
-        }
+        let nodes_snapshot = self
+            .nodes
+            .iter()
+            .map(|pair| pair.value().clone())
+            .collect::<Vec<_>>();
+        let nodes_to_remove = state::ids_to_remove_for_duplicate_domains(&nodes_snapshot);
 
-        let nodes_to_remove = {
-            let mut to_remove = Vec::new();
-            for pair in self.nodes.iter() {
-                let node = pair.value();
-                if let Some((best_id, _)) = by_alias.get(&node.domain)
-                    && *best_id != node.node_id
-                {
-                    to_remove.push(node.node_id);
-                }
-            }
-            to_remove
-        };
-
-        // Remove nodes that have the same alias but aren't the most recent
         for node_id in nodes_to_remove {
             self.nodes.remove(&node_id);
         }
 
-        self.handle.network_change().await;
+        let _ = timeout(Duration::from_secs(1), self.handle.network_change()).await;
     }
 
     pub async fn update_nodes(&self) {
+        let mut me = (*self.me).clone();
+        me.addr = self.handle.addr();
+        me.last_heartbeat = time_now();
+
         let nodes = self
             .nodes
             .iter()
             .map(|it| it.value().clone())
-            .chain([self.me.as_ref().clone()])
+            .chain([me])
             .collect::<Vec<_>>();
         let _ = self
             .broadcast_neighbor_message(Message::SyncRequest { nodes })
@@ -533,7 +563,7 @@ impl Context {
                 if let Some(node) = self.nodes.get(&from) {
                     self.static_provider.add_endpoint_info(node.addr.clone());
                 }
-                self.ticket.refresh(self.clone());
+                self.ticket.refresh(self);
                 log::info!("Node {} joined the chat", from);
                 log::info!("New Ticket: {}", self.ticket);
             }
@@ -683,20 +713,24 @@ impl Context {
             _ => log::warn!("Unknown message received"),
         }
 
-        self.handle.network_change().await;
+        let _ = timeout(Duration::from_secs(1), self.handle.network_change()).await;
     }
 
     pub async fn broadcast_message(&self, message: Message) -> Result<()> {
         log::debug!("Broadcasting message: {:?}", message);
         let bm = SignedMessage::sign_and_encode(self.handle.secret_key(), message)?;
-        self.sender.broadcast(bm).await?;
+        timeout(Duration::from_secs(3), self.sender.broadcast(bm))
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out broadcasting message"))??;
         Ok(())
     }
 
     pub async fn broadcast_neighbor_message(&self, message: Message) -> Result<()> {
         log::debug!("Broadcasting neighbor message: {:?}", message);
         let bm = SignedMessage::sign_and_encode(self.handle.secret_key(), message)?;
-        self.sender.broadcast_neighbors(bm).await?;
+        timeout(Duration::from_secs(3), self.sender.broadcast_neighbors(bm))
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out broadcasting neighbor message"))??;
         Ok(())
     }
 
@@ -711,10 +745,14 @@ impl Context {
             .get(id)
             .map(|node| node.addr.clone())
             .unwrap_or_else(|| (*id).into());
-        self.single_point
-            .send_msg(self.handle.clone(), target, message)
-            .await
-            .inspect_err(|e| log::error!("Failed to send message to {:?}: {:?}", id, e))?;
+        timeout(
+            Duration::from_secs(3),
+            self.single_point
+                .send_msg(self.handle.clone(), target, message),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out sending message to {id:?}"))?
+        .inspect_err(|e| log::error!("Failed to send message to {:?}: {:?}", id, e))?;
         Ok(())
     }
 
@@ -723,183 +761,4 @@ impl Context {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use std::collections::BTreeMap;
-
-    use super::*;
-
-    impl Node {
-        pub fn random_node() -> Self {
-            let mut rng = rand::rng();
-            let sk = SecretKey::generate(&mut rng);
-            let pk = sk.public();
-
-            Self {
-                node_id: pk,
-                invitor: pk,
-                domain: String::default(),
-                services: BTreeMap::new(),
-                last_heartbeat: 0,
-                addr: EndpointAddr::new(pk),
-            }
-        }
-    }
-
-    // #[test]
-    // fn test_signed_message_decode_and_verify() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试消息
-    //     let message = Message::AboutMe {
-    //         alias: "Test Alias".to_string(),
-    //         services: BTreeMap::new(),
-    //         invitor: NodeId::default(),
-    //     };
-
-    //     // 对消息进行签名和编码
-    //     let encoded_message =
-    //         SignedMessage::sign_and_encode(&ctx.handle.secret_key(), message).unwrap();
-
-    //     // 解码并验证消息
-    //     let (decoded_key, decoded_message, pass) =
-    //         SignedMessage::decode_and_verify(ctx, &encoded_message).unwrap();
-
-    //     // 验证解码结果
-    //     assert_eq!(decoded_message, message);
-    //     assert!(pass);
-    // }
-
-    // #[test]
-    // fn test_signed_message_sign_and_encode() {
-    //     // 创建测试消息
-    //     let message = Message::AboutMe {
-    //         alias: "Test Alias".to_string(),
-    //         services: BTreeMap::new(),
-    //         invitor: NodeId::default(),
-    //     };
-
-    //     // 对消息进行签名和编码
-    //     let encoded_message =
-    //         SignedMessage::sign_and_encode(&ctx.handle.secret_key(), message).unwrap();
-
-    //     // 验证编码结果
-    //     assert!(!encoded_message.is_empty());
-    // }
-
-    // #[test]
-    // fn test_init_network() {
-    //     // 创建测试参数
-    //     let args = Args::default();
-
-    //     // 创建测试存储
-    //     let storage = Storage::default();
-
-    //     // 初始化网络
-    //     let (context, receiver) = init_network(&args, storage).unwrap();
-
-    //     // 验证上下文和接收者是否创建成功
-    //     assert!(context.handle.is_bound());
-    //     assert!(receiver.is_some());
-    // }
-
-    // #[test]
-    // fn test_context_run() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试接收者
-    //     let mut receiver = GossipReceiver::default();
-
-    //     // 运行上下文
-    //     ctx.run(receiver).await.unwrap();
-    // }
-
-    // #[test]
-    // fn test_context_process_gossip() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试事件
-    //     let event = Event::Gossip(GossipEvent::Received(IrohMessage::default()));
-
-    //     // 处理事件
-    //     ctx.process_gossip(Ok(Some(event))).await;
-    // }
-
-    // #[test]
-    // fn test_context_process_discovery() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试发现项
-    //     let item = Some(Ok(DiscoveryItem::default()));
-
-    //     // 处理发现项
-    //     ctx.process_discovery(item).await;
-    // }
-
-    // #[test]
-    // fn test_context_process_message() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试消息
-    //     let message = IrohMessage::default();
-
-    //     // 处理消息
-    //     ctx.process_message(message).await;
-    // }
-
-    // #[test]
-    // fn test_context_broadcast_message() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试消息
-    //     let message = Message::AboutMe {
-    //         alias: "Test Alias".to_string(),
-    //         services: BTreeMap::new(),
-    //         invitor: NodeId::default(),
-    //     };
-
-    //     // 广播消息
-    //     ctx.broadcast_message(message).await.unwrap();
-    // }
-
-    // #[test]
-    // fn test_context_broadcast_neighbor_message() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试消息
-    //     let message = Message::AboutMe {
-    //         alias: "Test Alias".to_string(),
-    //         services: BTreeMap::new(),
-    //         invitor: NodeId::default(),
-    //     };
-
-    //     // 广播邻居消息
-    //     ctx.broadcast_neighbor_message(message).await.unwrap();
-    // }
-
-    // #[test]
-    // fn test_context_send_message_to() {
-    //     // 创建测试上下文
-    //     let ctx = Context::default();
-
-    //     // 创建测试节点 ID
-    //     let id = NodeId::default();
-
-    //     // 创建测试消息
-    //     let message = Message::AboutMe {
-    //         alias: "Test Alias".to_string(),
-    //         services: BTreeMap::new(),
-    //         invitor: NodeId::default(),
-    //     };
-
-    //     // 发送消息
-    //     ctx.send_message_to(&id, message).await.unwrap();
-    // }
-}
+// (tests moved into dedicated unit/integration test modules)

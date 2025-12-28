@@ -11,7 +11,7 @@ clap = { version = "4.5.32", features = ["derive"] }
 dashmap = "6.1.0"
 dirs = "6.0.0"
 env_logger = "0.11.7"
-iroh = { version = "0.95.1", default-features = false, features = ["discovery-local-network"] }
+iroh = { version = "0.95.1", default-features = false, features = ["discovery-local-network", "discovery-pkarr-dht"] }
 iroh-gossip = "0.95.0"
 log = "0.4.26"
 parking_lot = "0.12.3"

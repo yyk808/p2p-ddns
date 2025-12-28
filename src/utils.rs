@@ -1,10 +1,15 @@
 use core::fmt;
-use std::{fmt::Display, str::FromStr, sync::Arc};
+use std::{
+    fmt::Display,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Parser, builder::TypedValueParser};
-use iroh::discovery::UserData;
+use iroh::{EndpointAddr, discovery::UserData};
 use iroh_gossip::TopicId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -75,6 +80,10 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false, requires = "backend")]
     pub no_mdns: bool,
 
+    /// Enable DHT-based discovery (PKARR on Mainline DHT); helps in cross-subnet scenarios without DNS.
+    #[arg(long, default_value_t = false, requires = "backend")]
+    pub dht: bool,
+
     /// For debug convinience
     #[cfg(debug_assertions)]
     #[arg(long)]
@@ -107,16 +116,64 @@ impl Ticket {
         (inner.topic, inner.rnum.clone(), inner.invitor.clone())
     }
 
-    pub fn refresh(&self, ctx: Context) {
+    pub fn refresh(&self, ctx: &Context) {
+        let invitor = (*ctx.me).clone();
+        self.refresh_with(invitor, ctx.handle.addr(), time_now());
+    }
+
+    pub fn refresh_with(&self, mut invitor: Node, addr: EndpointAddr, now: u64) {
         let mut inner = self.inner.write();
         inner.rnum = rand::random::<[u8; 32]>().to_vec();
-        inner.invitor = (*ctx.me).clone();
+        invitor.addr = addr;
+        invitor.last_heartbeat = now;
+        inner.invitor = invitor;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_bind_addr_accepts_ipv4_and_ipv6() -> Result<()> {
+        parse_bind_addr("127.0.0.1:1234")?;
+        parse_bind_addr("[::1]:1234")?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_args_validate_rejects_invalid_bind() {
+        let mut args = CliArgs::default();
+        args.bind = Some("not-an-addr".to_string());
+        assert!(CliArgs::validate(&args).is_err());
+    }
+
+    #[test]
+    fn best_ip_for_display_prefers_ipv4_then_ipv6() {
+        let mut rng = rand::rng();
+        let sk = iroh::SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let v4: SocketAddr = "203.0.113.1:1".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+
+        let addr = EndpointAddr::from_parts(
+            pk,
+            [iroh::TransportAddr::Ip(v6), iroh::TransportAddr::Ip(v4)],
+        );
+        assert_eq!(best_ip_for_display(&addr), Some(v4.ip()));
+    }
+
+    #[test]
+    fn best_ip_for_display_uses_ipv6_when_no_ipv4() {
+        let mut rng = rand::rng();
+        let sk = iroh::SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let v6: SocketAddr = "[2001:db8::2]:1".parse().unwrap();
+        let addr = EndpointAddr::from_parts(pk, [iroh::TransportAddr::Ip(v6)]);
+        assert_eq!(best_ip_for_display(&addr), Some(v6.ip()));
+    }
 
     #[test]
     fn ticket_roundtrip_display_fromstr() -> Result<()> {
@@ -143,6 +200,36 @@ mod tests {
         assert_eq!(rnum_a, rnum_b);
         assert_eq!(invitor_a.node_id, invitor_b.node_id);
         Ok(())
+    }
+
+    #[test]
+    fn ticket_refresh_with_updates_rnum_and_invitor() {
+        let mut rng = rand::rng();
+        let sk = iroh::SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let node = Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::new(pk),
+            domain: "node".to_string(),
+            services: Default::default(),
+            last_heartbeat: 0,
+        };
+
+        let ticket = Ticket::new(None, node.clone());
+        let (topic_before, rnum_before, invitor_before) = ticket.flatten();
+        assert_eq!(invitor_before.last_heartbeat, 0);
+
+        let new_addr: SocketAddr = "[2001:db8::10]:1234".parse().unwrap();
+        let new_addr = EndpointAddr::from_parts(pk, [iroh::TransportAddr::Ip(new_addr)]);
+        ticket.refresh_with(node, new_addr.clone(), 42);
+
+        let (topic_after, rnum_after, invitor_after) = ticket.flatten();
+        assert_eq!(topic_before, topic_after);
+        assert_ne!(rnum_before, rnum_after);
+        assert_eq!(invitor_after.addr, new_addr);
+        assert_eq!(invitor_after.last_heartbeat, 42);
     }
 }
 
@@ -227,14 +314,8 @@ impl CliArgs {
             anyhow::bail!("alias length should be less than {}", UserData::MAX_LENGTH);
         }
 
-        if args.bind.as_ref().is_some_and(|b| {
-            !b.parse::<std::net::SocketAddr>()
-                .is_ok_and(|addr| addr.is_ipv4())
-        }) {
-            anyhow::bail!(
-                "Invalid bind address: {}, only accept IPv4 address for now",
-                args.bind.as_ref().unwrap()
-            );
+        if let Some(bind) = args.bind.as_deref() {
+            parse_bind_addr(bind)?;
         }
 
         Ok(())
@@ -324,6 +405,29 @@ pub fn time_now() -> u64 {
         .as_secs()
 }
 
+pub(crate) fn parse_bind_addr(bind: &str) -> Result<SocketAddr> {
+    Ok(bind.parse::<SocketAddr>()?)
+}
+
+pub(crate) fn best_ip_for_display(addr: &EndpointAddr) -> Option<IpAddr> {
+    let mut best_v6: Option<IpAddr> = None;
+    for sock in addr.ip_addrs() {
+        let ip = sock.ip();
+        if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() {
+            continue;
+        }
+
+        if ip.is_ipv4() {
+            return Some(ip);
+        }
+
+        if best_v6.is_none() {
+            best_v6 = Some(ip);
+        }
+    }
+    best_v6
+}
+
 fn format_duration(seconds: u64) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
@@ -342,14 +446,8 @@ pub fn output(ctx: Context) {
                 .unwrap()
                 .as_secs();
             let node = r.value();
-            // find out the first addr start with 10.xxx or 192.168.xxx
-            let addr = node
-                .addr
-                .ip_addrs()
-                .find(|addr| {
-                    addr.is_ipv4() && !addr.ip().is_loopback() && !addr.ip().is_multicast()
-                })
-                .map(|addr| addr.ip().to_string())
+            let addr = best_ip_for_display(&node.addr)
+                .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
             let alias = node.domain.clone();
             let last_seen = format_duration(now - node.last_heartbeat);

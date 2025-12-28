@@ -89,6 +89,24 @@ pub struct Node {
     pub last_heartbeat: u64,
 }
 
+#[cfg(test)]
+impl Node {
+    pub fn random_node() -> Self {
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        Self {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::new(pk),
+            domain: String::new(),
+            services: BTreeMap::new(),
+            last_heartbeat: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Auth {
     pub introducer: EndpointId,

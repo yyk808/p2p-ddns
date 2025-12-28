@@ -1,4 +1,6 @@
-use iroh::EndpointAddr;
+use std::collections::HashMap;
+
+use iroh::{EndpointAddr, EndpointId};
 
 use crate::types::Node;
 
@@ -38,6 +40,31 @@ pub fn merge_node(existing: Option<&Node>, incoming: &Node) -> (Node, bool) {
             (merged, true)
         }
     }
+}
+
+pub fn ids_to_remove_for_duplicate_domains(nodes: &[Node]) -> Vec<EndpointId> {
+    let mut by_domain: HashMap<&str, (EndpointId, u64)> = HashMap::new();
+    for node in nodes {
+        by_domain
+            .entry(node.domain.as_str())
+            .and_modify(|(best_id, best_heartbeat)| {
+                if node.last_heartbeat > *best_heartbeat {
+                    *best_id = node.node_id;
+                    *best_heartbeat = node.last_heartbeat;
+                }
+            })
+            .or_insert((node.node_id, node.last_heartbeat));
+    }
+
+    let mut to_remove = Vec::new();
+    for node in nodes {
+        if let Some((best_id, _)) = by_domain.get(node.domain.as_str())
+            && *best_id != node.node_id
+        {
+            to_remove.push(node.node_id);
+        }
+    }
+    to_remove
 }
 
 #[cfg(test)]
@@ -95,5 +122,33 @@ mod tests {
 
         let (merged, _) = merge_node(Some(&existing), &incoming);
         assert!(merged.addr.ip_addrs().any(|a| a == &existing_ip));
+    }
+
+    #[test]
+    fn ids_to_remove_for_duplicate_domains_removes_older() {
+        let mut rng = rand::rng();
+        let pk1 = SecretKey::generate(&mut rng).public();
+        let pk2 = SecretKey::generate(&mut rng).public();
+
+        let n1 = Node {
+            node_id: pk1,
+            invitor: pk1,
+            addr: EndpointAddr::new(pk1),
+            domain: "dup".to_string(),
+            services: BTreeMap::new(),
+            last_heartbeat: 10,
+        };
+        let n2 = Node {
+            node_id: pk2,
+            invitor: pk2,
+            addr: EndpointAddr::new(pk2),
+            domain: "dup".to_string(),
+            services: BTreeMap::new(),
+            last_heartbeat: 20,
+        };
+
+        let mut ids = ids_to_remove_for_duplicate_domains(&[n1, n2]);
+        ids.sort();
+        assert_eq!(ids, vec![pk1]);
     }
 }

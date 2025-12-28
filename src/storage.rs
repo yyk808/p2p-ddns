@@ -280,4 +280,36 @@ mod test {
         assert_eq!(pk, pk2);
         assert_eq!(sk.to_bytes(), sk2.to_bytes());
     }
+
+    #[test]
+    fn test_config_roundtrip_and_remove() {
+        let fd = tempfile().expect("Failed to create temp file");
+        let storage = Storage::try_from(fd).unwrap();
+
+        storage.save_config_trival("bind_port", 4242u16).unwrap();
+        let port: Option<u16> = storage.load_config("bind_port").unwrap();
+        assert_eq!(port, Some(4242));
+
+        storage.remove_config("bind_port").unwrap();
+        let port: Option<u16> = storage.load_config("bind_port").unwrap();
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn test_clear_removes_all_tables() {
+        let fd = tempfile().expect("Failed to create temp file");
+        let storage = Storage::try_from(fd).unwrap();
+
+        storage.save_config_trival("bind_port", 1u16).unwrap();
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        storage.save_secret(sk).unwrap();
+
+        storage.clear().unwrap();
+        let port: Option<u16> = storage.load_config("bind_port").unwrap();
+        assert_eq!(port, None);
+        assert!(storage.load_secret().unwrap().is_none());
+        let nodes = storage.load_nodes::<Vec<_>>().unwrap();
+        assert!(nodes.is_empty());
+    }
 }
