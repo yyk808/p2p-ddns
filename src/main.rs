@@ -8,7 +8,9 @@ use utils::{CliArgs, environment_detection};
 mod host;
 mod network;
 mod protocol;
+mod state;
 mod storage;
+mod types;
 mod utils;
 
 #[tokio::main]

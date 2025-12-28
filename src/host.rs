@@ -58,7 +58,7 @@ impl std::error::Error for Error {
 /// # Examples
 ///
 /// ```no_run
-/// use hostsfile::{HostsBuilder, Result};
+/// use p2p_ddns::host::{HostsBuilder, Result};
 /// # fn main() -> Result<()> {
 /// let mut hosts = HostsBuilder::new("dns");
 /// hosts.add_hostname("8.8.8.8".parse().unwrap(), "google-dns1");
@@ -80,7 +80,7 @@ impl std::error::Error for Error {
 /// Another run of `HostsBuilder` with the same tag name overrides the section.
 ///
 /// ```no_run
-/// use hostsfile::{HostsBuilder, Result};
+/// use p2p_ddns::host::{HostsBuilder, Result};
 /// # fn main() -> Result<()> {
 /// let mut hosts = HostsBuilder::new("dns");
 /// hosts.add_hostnames("1.1.1.1".parse().unwrap(), &["cloudflare-dns", "apnic-dns"]);

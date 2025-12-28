@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::network::{Context, Node};
+use crate::{network::Context, types::Node};
 
 #[derive(Debug, Clone)]
 pub struct Ticket {
@@ -71,6 +71,10 @@ pub struct CliArgs {
     #[arg(long, short = 'B', value_name = "BIND_ADDR")]
     pub bind: Option<String>,
 
+    /// Disable local-network discovery (mDNS)
+    #[arg(long, default_value_t = false, requires = "backend")]
+    pub no_mdns: bool,
+
     /// For debug convinience
     #[cfg(debug_assertions)]
     #[arg(long)]
@@ -107,6 +111,38 @@ impl Ticket {
         let mut inner = self.inner.write();
         inner.rnum = rand::random::<[u8; 32]>().to_vec();
         inner.invitor = (*ctx.me).clone();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticket_roundtrip_display_fromstr() -> Result<()> {
+        let mut rng = rand::rng();
+        let sk = iroh::SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let node = Node {
+            node_id: pk,
+            invitor: pk,
+            addr: iroh::EndpointAddr::new(pk),
+            domain: "node".to_string(),
+            services: Default::default(),
+            last_heartbeat: 123,
+        };
+
+        let ticket = Ticket::new(None, node);
+        let encoded = ticket.to_string();
+        let decoded: Ticket = encoded.parse()?;
+
+        let (topic_a, rnum_a, invitor_a) = ticket.flatten();
+        let (topic_b, rnum_b, invitor_b) = decoded.flatten();
+        assert_eq!(topic_a, topic_b);
+        assert_eq!(rnum_a, rnum_b);
+        assert_eq!(invitor_a.node_id, invitor_b.node_id);
+        Ok(())
     }
 }
 
@@ -212,6 +248,7 @@ impl CliArgs {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn environment_detection(args: &CliArgs) {
     // check if the user has permission to write to the default storage path
     let mut path = default_config_path(args);

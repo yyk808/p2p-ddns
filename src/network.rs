@@ -1,7 +1,5 @@
 use std::{
-    collections::BTreeMap,
-    hash::Hash,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -12,7 +10,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{FutureExt, StreamExt, TryStreamExt, channel::mpsc::Receiver};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey, Signature,
+    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey, TransportAddr,
     discovery::{UserData, mdns::MdnsDiscovery, static_provider::StaticProvider},
     protocol::{Router, RouterBuilder},
 };
@@ -21,95 +19,17 @@ use iroh_gossip::{
     api::{Event, GossipReceiver, GossipSender},
 };
 use rand::{Rng, distr::Alphanumeric};
-use serde::{Deserialize, Serialize};
 use tokio::time::{interval, timeout};
 
 use crate::{
     protocol::P2Protocol,
+    state,
     storage::Storage,
+    types::{Auth, Message, Node, SignedMessage},
     utils::{CliArgs, Ticket, output, time_now},
 };
 
 pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Message {
-    Invited {
-        topic: TopicId,
-        rnum: Vec<u8>,
-        alias: String,
-        services: BTreeMap<String, u32>,
-    },
-    AboutMe {
-        alias: String,
-        services: BTreeMap<String, u32>,
-        invitor: EndpointId,
-    },
-    Introduce {
-        invited: EndpointId,
-    },
-    SyncRequest {
-        nodes: Vec<Node>,
-    },
-    SyncResponse {
-        nodes: Vec<Node>,
-    },
-    Heartbeat,
-    Left,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct SignedMessage {
-    pub(crate) from: EndpointId,
-    pub(crate) data: Bytes,
-    signature: Signature,
-    timestamp: u64,
-}
-
-impl SignedMessage {
-    pub fn decode_and_verify(ctx: Context, bytes: Bytes) -> Result<(PublicKey, Message, bool)> {
-        let signed_message: Self = postcard::from_bytes(bytes.as_ref())?;
-        let key: PublicKey = signed_message.from;
-
-        key.verify(&signed_message.data, &signed_message.signature)?;
-        let message: Message = postcard::from_bytes(&signed_message.data)?;
-        let passed = ctx.is_node_trusted(&key) && signed_message.timestamp < time_now() + 10;
-        Ok((signed_message.from, message, passed))
-    }
-
-    pub fn sign_and_encode(secret_key: &SecretKey, message: Message) -> Result<Bytes> {
-        let data: Bytes = postcard::to_stdvec(&message)?.into();
-        let signature = secret_key.sign(&data);
-        let from: PublicKey = secret_key.public();
-        let timestamp = time_now();
-        let signed_message = Self {
-            from,
-            data,
-            signature,
-            timestamp,
-        };
-        let encoded = postcard::to_stdvec(&signed_message)?;
-        Ok(encoded.into())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Node {
-    pub node_id: EndpointId,
-    pub invitor: EndpointId,
-    pub(crate) addr: EndpointAddr,
-    pub domain: String,
-    pub services: BTreeMap<String, u32>,
-    pub last_heartbeat: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct Auth {
-    pub introducer: EndpointId,
-    pub introduced: bool,
-    pub node: Option<Box<Node>>,
-    pub timestamp: u64,
-}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -118,6 +38,7 @@ pub struct Context {
     pub storage: Storage,
     pub router: Router,
     pub gossip: Gossip,
+    pub(crate) static_provider: StaticProvider,
     pub single_point: P2Protocol,
     pub ticket: Ticket,
     pub nodes: DashMap<EndpointId, Node>,
@@ -126,34 +47,6 @@ pub struct Context {
     pub args: CliArgs,
     pub pending_auth: DashMap<EndpointId, Auth>,
 }
-
-impl Hash for Node {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.node_id.hash(state);
-    }
-}
-
-impl PartialEq for Node {
-    fn eq(&self, other: &Self) -> bool {
-        self.node_id == other.node_id
-    }
-}
-
-impl Eq for Node {}
-
-impl Hash for Auth {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.introducer.hash(state);
-    }
-}
-
-impl PartialEq for Auth {
-    fn eq(&self, other: &Self) -> bool {
-        self.introducer == other.introducer
-    }
-}
-
-impl Eq for Auth {}
 
 pub async fn init_network(
     args: CliArgs,
@@ -214,7 +107,7 @@ pub async fn init_network(
         .bind_addr_v4(bind_addr)
         .discovery(sp.clone());
 
-    if args.daemon {
+    if args.daemon && !args.no_mdns {
         endpoint_builder = endpoint_builder.discovery(MdnsDiscovery::builder());
     }
 
@@ -230,7 +123,7 @@ pub async fn init_network(
     let me = Node {
         node_id: pk,
         invitor: invitor.unwrap_or(pk),
-        addr: endpoint.addr(),
+        addr: EndpointAddr::from_parts(pk, [TransportAddr::Ip(SocketAddr::V4(bind_addr))]),
         domain,
         services: Default::default(), // reserved
         last_heartbeat: time_now(),
@@ -322,6 +215,7 @@ pub async fn init_network(
         storage,
         router,
         gossip,
+        static_provider: sp,
         single_point: p2p,
         ticket,
         nodes: bootstrap_nodes,
@@ -335,6 +229,20 @@ pub async fn init_network(
 }
 
 impl Context {
+    fn decode_and_verify(&self, bytes: Bytes) -> Result<(PublicKey, Message, bool)> {
+        let signed = SignedMessage::decode(bytes)?;
+        let (from, message) = signed.verify_and_decode_message()?;
+        let passed = self.is_node_trusted(&from) && signed.is_fresh(time_now());
+        Ok((from, message, passed))
+    }
+
+    fn merge_existing_addr(&self, node_id: &EndpointId, incoming: EndpointAddr) -> EndpointAddr {
+        self.nodes
+            .get(node_id)
+            .map(|node| state::merge_addr(&node.addr, &incoming))
+            .unwrap_or(incoming)
+    }
+
     pub async fn run(
         &self,
         mut gos_recv: GossipReceiver,
@@ -349,6 +257,7 @@ impl Context {
                 let invited = Message::Invited {
                     topic: self.ticket.topic(),
                     rnum,
+                    addr: self.me.addr.clone(),
                     alias: self.me.domain.clone(),
                     services: self.me.services.clone(),
                 };
@@ -357,6 +266,7 @@ impl Context {
                 }
             }
             let about_me = Message::AboutMe {
+                addr: self.me.addr.clone(),
                 alias: self.me.domain.clone(),
                 services: self.me.services.clone(),
                 invitor: self.me.invitor,
@@ -397,7 +307,7 @@ impl Context {
                 },
                 bmsg = sp_recv.next().fuse() => {
                     if let Some(bmsg) = bmsg {
-                        if let Ok((from, msg, passed)) = SignedMessage::decode_and_verify(self.clone(), bmsg) {
+                        if let Ok((from, msg, passed)) = self.decode_and_verify(bmsg) {
                             log::debug!("Received p2p msg: {:?}", msg);
                             self.process_message(from, msg, passed).await;
                         } else {
@@ -407,6 +317,72 @@ impl Context {
                 },
                 evt = gos_recv.try_next().fuse() => {
                     self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn run_for(
+        &self,
+        mut gos_recv: GossipReceiver,
+        mut sp_recv: Receiver<Bytes>,
+        rnum: Option<Vec<u8>>,
+        duration: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut cron_jobs = interval(Duration::from_millis(200));
+
+        if self.args.daemon {
+            if let Some(rnum) = rnum {
+                let invited = Message::Invited {
+                    topic: self.ticket.topic(),
+                    rnum,
+                    addr: self.me.addr.clone(),
+                    alias: self.me.domain.clone(),
+                    services: self.me.services.clone(),
+                };
+                let _ = self.broadcast_message(invited).await;
+            }
+
+            let about_me = Message::AboutMe {
+                addr: self.me.addr.clone(),
+                alias: self.me.domain.clone(),
+                services: self.me.services.clone(),
+                invitor: self.me.invitor,
+            };
+            let _ = self.broadcast_message(about_me).await;
+        }
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = cron_jobs.tick() => {
+                    if self.args.daemon {
+                        let nodes = self
+                            .nodes
+                            .iter()
+                            .map(|it| it.value().clone())
+                            .chain([self.me.as_ref().clone()])
+                            .collect::<Vec<_>>();
+                        let _ = self.broadcast_neighbor_message(Message::SyncRequest { nodes }).await;
+                    }
+                }
+                bmsg = sp_recv.next() => {
+                    if let Some(bmsg) = bmsg {
+                        if let Ok((from, msg, passed)) = self.decode_and_verify(bmsg) {
+                            self.process_message(from, msg, passed).await;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                evt = gos_recv.next() => {
+                    match evt {
+                        Some(Ok(evt)) => self.process_gossip(Ok(Some(evt))).await,
+                        Some(Err(e)) => self.process_gossip(Err(anyhow::anyhow!(e))).await,
+                        None => break,
+                    }
                 }
             }
         }
@@ -498,9 +474,7 @@ impl Context {
                     self.pending_auth.remove(&endpoint_id);
                 }
                 Event::Received(msg) => {
-                    if let Ok((from, message, passed)) =
-                        SignedMessage::decode_and_verify(self.clone(), msg.content)
-                    {
+                    if let Ok((from, message, passed)) = self.decode_and_verify(msg.content) {
                         self.process_message(from, message, passed).await;
                     }
                 }
@@ -527,6 +501,7 @@ impl Context {
             Message::Invited {
                 topic,
                 rnum,
+                addr,
                 alias,
                 services,
             } => {
@@ -537,7 +512,12 @@ impl Context {
                     log::info!("Trusting node: {:?} for it holds our ticket", from);
                 }
 
-                let addr = EndpointAddr::new(from);
+                let addr = if addr.id == from {
+                    addr
+                } else {
+                    EndpointAddr::new(from)
+                };
+                let addr = self.merge_existing_addr(&from, addr);
 
                 let node = Node {
                     node_id: from,
@@ -550,16 +530,25 @@ impl Context {
 
                 self.pending_auth.remove(&from);
                 self.nodes.insert(from, node);
+                if let Some(node) = self.nodes.get(&from) {
+                    self.static_provider.add_endpoint_info(node.addr.clone());
+                }
                 self.ticket.refresh(self.clone());
                 log::info!("Node {} joined the chat", from);
                 log::info!("New Ticket: {}", self.ticket);
             }
             Message::AboutMe {
+                addr,
                 alias,
                 services,
                 invitor,
             } => {
-                let addr = EndpointAddr::new(from);
+                let addr = if addr.id == from {
+                    addr
+                } else {
+                    EndpointAddr::new(from)
+                };
+                let addr = self.merge_existing_addr(&from, addr);
 
                 let node = Node {
                     node_id: from,
@@ -585,6 +574,9 @@ impl Context {
                         // This node has been introduced, we can trust it now.
                         self.pending_auth.remove(&from);
                         self.nodes.insert(from, node);
+                        if let Some(node) = self.nodes.get(&from) {
+                            self.static_provider.add_endpoint_info(node.addr.clone());
+                        }
                     }
                 } else {
                     // This node has not been introduced yet.
@@ -616,8 +608,9 @@ impl Context {
                         // This node has sent 'AboutMe' message before.
                         assert!(auth.node.is_some());
                         if let Some((id, auth)) = self.pending_auth.remove(&from) {
-                            let node = auth.node.unwrap();
-                            self.nodes.insert(id, *node);
+                            let mut node = *auth.node.unwrap();
+                            node.addr = self.merge_existing_addr(&id, node.addr.clone());
+                            self.nodes.insert(id, node);
                         }
                     }
                 } else {
@@ -639,19 +632,18 @@ impl Context {
             }
             Message::SyncRequest { nodes } => {
                 if !self.args.daemon || passed {
-                    nodes.iter().for_each(|node| {
-                        let should_update = {
-                            let target = self.nodes.get(&node.node_id);
-                            target.is_none()
-                                || target
-                                    .as_ref()
-                                    .is_some_and(|t| t.last_heartbeat < node.last_heartbeat)
+                    for node in nodes {
+                        let existing = self.nodes.get(&node.node_id);
+                        let should_update = match existing.as_ref() {
+                            None => true,
+                            Some(existing) => existing.last_heartbeat < node.last_heartbeat,
                         };
                         if should_update {
-                            log::debug!("Updating node: {:?}", node);
-                            self.nodes.insert(node.node_id, node.clone());
+                            let (merged, _) = state::merge_node(existing.as_deref(), &node);
+                            self.static_provider.add_endpoint_info(merged.addr.clone());
+                            self.nodes.insert(merged.node_id, merged);
                         }
-                    });
+                    }
                 }
 
                 if self.args.daemon {
@@ -672,19 +664,18 @@ impl Context {
                 // A message from a trusted node is always valid.
                 // Or if we are a client, we simply trust everything.
                 if !self.args.daemon || passed {
-                    nodes.iter().for_each(|node| {
-                        let should_update = {
-                            let target = self.nodes.get(&node.node_id);
-                            target.is_none()
-                                || target
-                                    .as_ref()
-                                    .is_some_and(|t| t.last_heartbeat < node.last_heartbeat)
+                    for node in nodes {
+                        let existing = self.nodes.get(&node.node_id);
+                        let should_update = match existing.as_ref() {
+                            None => true,
+                            Some(existing) => existing.last_heartbeat < node.last_heartbeat,
                         };
                         if should_update {
-                            log::debug!("Updating node: {:?}", node);
-                            self.nodes.insert(node.node_id, node.clone());
+                            let (merged, _) = state::merge_node(existing.as_deref(), &node);
+                            self.static_provider.add_endpoint_info(merged.addr.clone());
+                            self.nodes.insert(merged.node_id, merged);
                         }
-                    });
+                    }
                 }
             }
 
@@ -715,8 +706,13 @@ impl Context {
         }
 
         log::debug!("Sending message to {:?}: {:?}", id, message);
+        let target = self
+            .nodes
+            .get(id)
+            .map(|node| node.addr.clone())
+            .unwrap_or_else(|| (*id).into());
         self.single_point
-            .send_msg(self.handle.clone(), *id, message)
+            .send_msg(self.handle.clone(), target, message)
             .await
             .inspect_err(|e| log::error!("Failed to send message to {:?}: {:?}", id, e))?;
         Ok(())
@@ -729,6 +725,8 @@ impl Context {
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     impl Node {

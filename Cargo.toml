@@ -10,18 +10,17 @@ bytes = "1.10.1"
 clap = { version = "4.5.32", features = ["derive"] }
 dashmap = "6.1.0"
 dirs = "6.0.0"
-ed25519 = "2.2.3"
 env_logger = "0.11.7"
-iroh = { version = "0.33.0", default-features = false , features = ["discovery-local-network"] }
-iroh-gossip = "0.33.0"
+iroh = { version = "0.95.1", default-features = false, features = ["discovery-local-network"] }
+iroh-gossip = "0.95.0"
 log = "0.4.26"
 parking_lot = "0.12.3"
 postcard = "1.1.1"
-rand = "0.8.0" # to satisfy iroh version requirement
+rand = "0.9"
 redb = "2.4.0"
 serde = "1.0.219"
 tabled = { version = "0.18.0", features = ["std", "ansi", "derive"]}
-compio = { version = "0.14.0", features = ["macros", "time", "signal"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "time"] }
 futures = "0.3.31"
 
 [dev-dependencies]

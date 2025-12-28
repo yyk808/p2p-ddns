@@ -5,7 +5,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
 use std::{fs::File, path::Path, sync::Arc};
 
-use crate::{network::Node, utils::CliArgs};
+use crate::{types::Node, utils::CliArgs};
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 const SECRERT: TableDefinition<&str, &str> = TableDefinition::new("secret");
