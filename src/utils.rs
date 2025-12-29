@@ -42,7 +42,7 @@ pub enum LogLevel {
 
 #[derive(Debug, Default, Clone, Parser)]
 #[command(version, about, long_about = None)]
-pub struct CliArgs {
+pub struct DaemonArgs {
     /// Running mode, daemon or client(default)
     #[arg(short, long, default_value_t = false, group = "backend")]
     pub daemon: bool,
@@ -142,10 +142,10 @@ mod tests {
     }
 
     #[test]
-    fn cli_args_validate_rejects_invalid_bind() {
-        let mut args = CliArgs::default();
+    fn daemon_args_validate_rejects_invalid_bind() {
+        let mut args = DaemonArgs::default();
         args.bind = Some("not-an-addr".to_string());
-        assert!(CliArgs::validate(&args).is_err());
+        assert!(DaemonArgs::validate(&args).is_err());
     }
 
     #[test]
@@ -304,7 +304,7 @@ impl Display for LogLevel {
     }
 }
 
-impl CliArgs {
+impl DaemonArgs {
     pub fn validate(args: &Self) -> Result<()> {
         if args
             .domain
@@ -330,7 +330,7 @@ impl CliArgs {
 }
 
 #[allow(dead_code)]
-pub(crate) fn environment_detection(args: &CliArgs) {
+pub(crate) fn environment_detection(args: &DaemonArgs) {
     // check if the user has permission to write to the default storage path
     let mut path = default_config_path(args);
     let error = if !path.exists() {
@@ -347,7 +347,7 @@ pub(crate) fn environment_detection(args: &CliArgs) {
     }
 }
 
-pub(crate) fn default_config_path(args: &CliArgs) -> PathBuf {
+pub(crate) fn default_config_path(args: &DaemonArgs) -> PathBuf {
     // depending on platform and running_mode, return the default path
     if let Some(path) = &args.config {
         return path.clone();

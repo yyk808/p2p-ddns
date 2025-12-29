@@ -27,8 +27,8 @@ use crate::{
     protocol::P2Protocol,
     state,
     storage::Storage,
-    types::{Auth, Message, Node, SignedMessage},
-    utils::{CliArgs, Ticket, output, time_now},
+    types::{Auth, ClientInfo, Message, Node, SignedMessage},
+    utils::{DaemonArgs, Ticket, output, time_now},
 };
 
 pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
@@ -46,12 +46,13 @@ pub struct Context {
     pub nodes: DashMap<EndpointId, Node>,
     pub me: Arc<Node>,
     pub sender: GossipSender,
-    pub args: CliArgs,
+    pub args: DaemonArgs,
     pub pending_auth: DashMap<EndpointId, Auth>,
+    pub client_nodes: DashMap<EndpointId, ClientInfo>,
 }
 
 pub async fn init_network(
-    args: CliArgs,
+    args: DaemonArgs,
     storage: Storage,
 ) -> Result<(Context, GossipReceiver, Receiver<Bytes>, Option<Vec<u8>>)> {
     // When creating a new network, un-trust all nodes and clear cache.
@@ -255,6 +256,7 @@ pub async fn init_network(
         sender,
         args,
         pending_auth: DashMap::new(),
+        client_nodes: DashMap::new(),
     };
 
     Ok((context, receiver, msg_receiver, invitor_rnum))
@@ -759,6 +761,37 @@ impl Context {
     pub fn is_node_trusted(&self, id: &EndpointId) -> bool {
         self.nodes.contains_key(id)
     }
-}
 
-// (tests moved into dedicated unit/integration test modules)
+    pub fn is_client_node(&self, node_id: &EndpointId) -> bool {
+        self.client_nodes.contains_key(node_id)
+    }
+
+    pub fn add_client(&self, node_id: EndpointId, info: ClientInfo) {
+        self.client_nodes.insert(node_id, info);
+        log::info!("Client {:?} added", node_id);
+    }
+
+    pub fn remove_client(&self, node_id: &EndpointId) {
+        self.client_nodes.remove(node_id);
+        log::info!("Client {:?} removed", node_id);
+    }
+
+    pub fn check_client_permission(&self, node_id: &EndpointId, perm: &str) -> bool {
+        match self.client_nodes.get(node_id) {
+            Some(info) => {
+                match perm {
+                    "query" => info.permissions.can_query,
+                    "add_node" => info.permissions.can_add_node,
+                    "remove_node" => info.permissions.can_remove_node,
+                    "control" => info.permissions.can_control,
+                    _ => false,
+                }
+            }
+            None => false,
+        }
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.client_nodes.len()
+    }
+}

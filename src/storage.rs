@@ -5,7 +5,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
 use std::{fs::File, path::Path, sync::Arc};
 
-use crate::{types::Node, utils::CliArgs};
+use crate::{types::Node, utils::DaemonArgs};
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 const SECRERT: TableDefinition<&str, &str> = TableDefinition::new("secret");
@@ -225,7 +225,7 @@ impl TryFrom<File> for Storage {
     }
 }
 
-pub async fn init_storage(args: &CliArgs) -> Result<Storage> {
+pub async fn init_storage(args: &DaemonArgs) -> Result<Storage> {
     let mut db_path = crate::utils::default_config_path(args);
     db_path.push("storage.db");
     if !db_path.exists() {
