@@ -1,8 +1,7 @@
-pub mod host;
-pub mod network;
-pub mod protocol;
-pub mod state;
+pub mod admin;
+pub mod cli;
+pub mod domain;
+pub mod hosts;
+pub mod net;
 pub mod storage;
-pub mod types;
-pub mod utils;
-pub mod client_daemon_protocol;
+pub mod util;

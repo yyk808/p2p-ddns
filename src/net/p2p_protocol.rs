@@ -7,7 +7,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 
-use crate::types::{Message, SignedMessage};
+use crate::domain::message::{Message, SignedMessage};
 
 #[derive(Debug, Clone)]
 pub struct P2Protocol {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use iroh::{EndpointAddr, EndpointId};
 
-use crate::types::Node;
+use crate::domain::node::Node;
 
 pub fn has_ip_addr(addr: &EndpointAddr) -> bool {
     addr.ip_addrs().next().is_some()

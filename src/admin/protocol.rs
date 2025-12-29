@@ -1,11 +1,11 @@
-use crate::types::{Node, DaemonStatus};
+use crate::domain::{client::DaemonStatus, node::Node};
 use serde::{Deserialize, Serialize};
 
 /// Client到Daemon的认证请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthRequest {
     pub ticket: String,
-    pub client_public_key: Option<String>,  // Base64编码的公钥
+    pub client_public_key: Option<String>,
     pub client_name: Option<String>,
 }
 
@@ -14,7 +14,7 @@ pub struct AuthRequest {
 pub struct AuthResponse {
     pub success: bool,
     pub error: Option<String>,
-    pub daemon_public_key: Option<String>,  // Daemon的公钥（base64编码）
+    pub daemon_public_key: Option<String>,
 }
 
 /// Client管理命令
@@ -38,4 +38,11 @@ pub enum ClientResponse {
     Ticket(String),
     Ack,
     Error(String),
+}
+
+/// HTTP等无连接场景下的一次性请求封装
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminCommandRequest {
+    pub auth: AuthRequest,
+    pub command: ClientCommand,
 }

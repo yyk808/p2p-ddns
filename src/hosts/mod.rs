@@ -1,3 +1,5 @@
+//! Hosts file helpers.
+
 // Copyright (c) 2023 tonarino
 //
 // This file is adapted from https://github.com/tonarino/innernet/blob/788843ace475a93566be7c6f0fd50e8e7ff893a9/hostsfile/src/lib.rs
@@ -58,7 +60,7 @@ impl std::error::Error for Error {
 /// # Examples
 ///
 /// ```no_run
-/// use p2p_ddns::host::{HostsBuilder, Result};
+/// use p2p_ddns::hosts::{HostsBuilder, Result};
 /// # fn main() -> Result<()> {
 /// let mut hosts = HostsBuilder::new("dns");
 /// hosts.add_hostname("8.8.8.8".parse().unwrap(), "google-dns1");
@@ -80,7 +82,7 @@ impl std::error::Error for Error {
 /// Another run of `HostsBuilder` with the same tag name overrides the section.
 ///
 /// ```no_run
-/// use p2p_ddns::host::{HostsBuilder, Result};
+/// use p2p_ddns::hosts::{HostsBuilder, Result};
 /// # fn main() -> Result<()> {
 /// let mut hosts = HostsBuilder::new("dns");
 /// hosts.add_hostnames("1.1.1.1".parse().unwrap(), &["cloudflare-dns", "apnic-dns"]);

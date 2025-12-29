@@ -1,7 +1,10 @@
+pub mod p2p_protocol;
+
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str::FromStr,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -24,14 +27,26 @@ use rand::{Rng, distr::Alphanumeric};
 use tokio::time::{interval, timeout};
 
 use crate::{
-    protocol::P2Protocol,
-    state,
+    cli::args::DaemonArgs,
+    domain::{
+        merge,
+        message::{Message, SignedMessage},
+        node::Node,
+        ticket::Ticket,
+    },
+    net::p2p_protocol::P2Protocol,
     storage::Storage,
-    types::{Auth, ClientInfo, Message, Node, SignedMessage},
-    utils::{DaemonArgs, Ticket, output, time_now},
+    util::time_now,
 };
 
-pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct Auth {
+    pub(crate) introducer: EndpointId,
+    pub(crate) introduced: bool,
+    pub(crate) node: Option<Box<Node>>,
+    pub(crate) timestamp: u64,
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -47,8 +62,9 @@ pub struct Context {
     pub me: Arc<Node>,
     pub sender: GossipSender,
     pub args: DaemonArgs,
-    pub pending_auth: DashMap<EndpointId, Auth>,
-    pub client_nodes: DashMap<EndpointId, ClientInfo>,
+    pub(crate) pending_auth: DashMap<EndpointId, Auth>,
+    started_at: u64,
+    paused: Arc<AtomicBool>,
 }
 
 pub async fn init_network(
@@ -149,7 +165,7 @@ pub async fn init_network(
     let p2p = P2Protocol::new(msg_sender);
     let router = RouterBuilder::new(endpoint.clone())
         .accept(ALPN, gossip.clone())
-        .accept(P2P_ALPN, p2p.clone())
+        .accept(P2Protocol::P2P_ALPN, p2p.clone())
         .spawn();
     let mut me = Node {
         node_id: pk,
@@ -256,7 +272,8 @@ pub async fn init_network(
         sender,
         args,
         pending_auth: DashMap::new(),
-        client_nodes: DashMap::new(),
+        started_at: time_now(),
+        paused: Arc::new(AtomicBool::new(false)),
     };
 
     Ok((context, receiver, msg_receiver, invitor_rnum))
@@ -287,7 +304,7 @@ impl Context {
     fn merge_existing_addr(&self, node_id: &EndpointId, incoming: EndpointAddr) -> EndpointAddr {
         self.nodes
             .get(node_id)
-            .map(|node| state::merge_addr(&node.addr, &incoming))
+            .map(|node| merge::merge_addr(&node.addr, &incoming))
             .unwrap_or(incoming)
     }
 
@@ -342,12 +359,10 @@ impl Context {
                     break;
                 },
                 _ = cron_jobs.tick().fuse() => {
-                    if self.args.daemon {
+                    if self.args.daemon && !self.is_paused() {
                         let _ = self.broadcast_message(Message::Heartbeat).await;
                         self.update_nodes().await;
                     }
-                    output(self.clone());
-
                     self.cleanup().await;
                     if let Err(e) = self.save().await {
                         log::error!("Failed to save nodes to storage: {:?}", e);
@@ -474,7 +489,7 @@ impl Context {
             .iter()
             .map(|pair| pair.value().clone())
             .collect::<Vec<_>>();
-        let nodes_to_remove = state::ids_to_remove_for_duplicate_domains(&nodes_snapshot);
+        let nodes_to_remove = merge::ids_to_remove_for_duplicate_domains(&nodes_snapshot);
 
         for node_id in nodes_to_remove {
             self.nodes.remove(&node_id);
@@ -565,7 +580,8 @@ impl Context {
                 if let Some(node) = self.nodes.get(&from) {
                     self.static_provider.add_endpoint_info(node.addr.clone());
                 }
-                self.ticket.refresh(self);
+                self.ticket
+                    .refresh_from((*self.me).clone(), self.handle.addr());
                 log::info!("Node {} joined the chat", from);
                 log::info!("New Ticket: {}", self.ticket);
             }
@@ -671,7 +687,7 @@ impl Context {
                             Some(existing) => existing.last_heartbeat < node.last_heartbeat,
                         };
                         if should_update {
-                            let (merged, _) = state::merge_node(existing.as_deref(), &node);
+                            let (merged, _) = merge::merge_node(existing.as_deref(), &node);
                             self.static_provider.add_endpoint_info(merged.addr.clone());
                             self.nodes.insert(merged.node_id, merged);
                         }
@@ -703,7 +719,7 @@ impl Context {
                             Some(existing) => existing.last_heartbeat < node.last_heartbeat,
                         };
                         if should_update {
-                            let (merged, _) = state::merge_node(existing.as_deref(), &node);
+                            let (merged, _) = merge::merge_node(existing.as_deref(), &node);
                             self.static_provider.add_endpoint_info(merged.addr.clone());
                             self.nodes.insert(merged.node_id, merged);
                         }
@@ -762,36 +778,15 @@ impl Context {
         self.nodes.contains_key(id)
     }
 
-    pub fn is_client_node(&self, node_id: &EndpointId) -> bool {
-        self.client_nodes.contains_key(node_id)
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
-    pub fn add_client(&self, node_id: EndpointId, info: ClientInfo) {
-        self.client_nodes.insert(node_id, info);
-        log::info!("Client {:?} added", node_id);
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
     }
 
-    pub fn remove_client(&self, node_id: &EndpointId) {
-        self.client_nodes.remove(node_id);
-        log::info!("Client {:?} removed", node_id);
-    }
-
-    pub fn check_client_permission(&self, node_id: &EndpointId, perm: &str) -> bool {
-        match self.client_nodes.get(node_id) {
-            Some(info) => {
-                match perm {
-                    "query" => info.permissions.can_query,
-                    "add_node" => info.permissions.can_add_node,
-                    "remove_node" => info.permissions.can_remove_node,
-                    "control" => info.permissions.can_control,
-                    _ => false,
-                }
-            }
-            None => false,
-        }
-    }
-
-    pub fn client_count(&self) -> usize {
-        self.client_nodes.len()
+    pub fn uptime_seconds(&self) -> u64 {
+        time_now().saturating_sub(self.started_at)
     }
 }

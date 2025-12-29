@@ -5,10 +5,10 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
 use std::{fs::File, path::Path, sync::Arc};
 
-use crate::{types::Node, utils::DaemonArgs};
+use crate::domain::node::Node;
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
-const SECRERT: TableDefinition<&str, &str> = TableDefinition::new("secret");
+const SECRET: TableDefinition<&str, &str> = TableDefinition::new("secret");
 const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 
 #[derive(Debug, Clone)]
@@ -107,7 +107,7 @@ impl Storage {
         let write_txn = self.db.begin_write()?;
 
         {
-            let mut table = write_txn.open_table(SECRERT)?;
+            let mut table = write_txn.open_table(SECRET)?;
 
             let sks = STANDARD_NO_PAD.encode(sk.to_bytes());
             let _ = table.insert("sk", sks.as_str())?;
@@ -120,7 +120,7 @@ impl Storage {
     pub fn load_secret(&self) -> Result<Option<(PublicKey, SecretKey)>> {
         let read_txn = self.db.begin_read()?;
 
-        let table = match read_txn.open_table(SECRERT) {
+        let table = match read_txn.open_table(SECRET) {
             Ok(table) => table,
             Err(_) => return Ok(None),
         };
@@ -207,7 +207,7 @@ impl Storage {
         let write_txn = self.db.begin_write()?;
         {
             write_txn.delete_table(TABLE)?;
-            write_txn.delete_table(SECRERT)?;
+            write_txn.delete_table(SECRET)?;
             write_txn.delete_table(CONFIG)?;
         }
         write_txn.commit()?;
@@ -225,17 +225,18 @@ impl TryFrom<File> for Storage {
     }
 }
 
-pub async fn init_storage(args: &DaemonArgs) -> Result<Storage> {
-    let mut db_path = crate::utils::default_config_path(args);
-    db_path.push("storage.db");
+pub fn open_or_create<P: AsRef<Path>>(db_path: P) -> Result<Storage> {
+    let db_path = db_path.as_ref();
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     if !db_path.exists() {
         log::info!("Creating new database file at {:?}", db_path);
-        std::fs::File::create(&db_path)?;
+        std::fs::File::create(db_path)?;
     } else {
         log::debug!("Loading existing database file at {:?}", db_path);
     }
-    let storage = Storage::new(db_path)?;
-    Ok(storage)
+    Storage::new(db_path)
 }
 
 #[cfg(test)]
