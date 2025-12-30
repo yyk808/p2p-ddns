@@ -48,11 +48,10 @@ COPY --from=builder /app/bin/p2p-ddns /usr/local/bin/p2p-ddns
 RUN mkdir -p /app/data /app/logs /app/config /shared && \
     chown -R testuser:testuser /app /shared
 
-# Copy scripts and configurations
-COPY tests/integration/scripts/ /app/scripts/
-
-# Make scripts executable
-RUN chmod +x /app/scripts/*.sh
+# Copy runtime scripts (only what containers need at runtime)
+RUN mkdir -p /app/scripts
+COPY tests/integration/scripts/health-check.sh /app/scripts/health-check.sh
+RUN chmod +x /app/scripts/health-check.sh
 
 # Switch to non-root user
 USER testuser

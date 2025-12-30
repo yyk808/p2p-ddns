@@ -34,13 +34,15 @@ cargo doc --no-deps            # Generate documentation
 
 ### Integration Tests
 ```bash
-./test-integration.sh full      # Build (if needed) + run default matrix suite
-./test-integration.sh quick     # Quick smoke test
-./test-integration.sh clean     # Remove leftover matrix Docker resources
+# Docker-based P2P tests (testcontainers-rs)
+P2P_DDNS_IT=1 cargo test --test docker_p2p -- docker_p2p_smoke
+P2P_DDNS_IT_MATRIX=1 cargo test --test docker_p2p
 
-cd tests/integration
-./single-machine-test.sh full
-./scripts/p2p-matrix.sh --list
+# Useful toggles
+P2P_DDNS_IT_SUBNETS=2 P2P_DDNS_IT_DAEMONS=10 P2P_DDNS_IT=1 cargo test --test docker_p2p -- docker_p2p_smoke
+P2P_DDNS_IT_NO_BUILD=1 P2P_DDNS_IT=1 cargo test --test docker_p2p -- docker_p2p_smoke
+P2P_DDNS_IT_KEEP_DOCKER=1 P2P_DDNS_IT=1 cargo test --test docker_p2p -- docker_p2p_smoke -- --nocapture
+P2P_DDNS_IT_CASE=partition-recover P2P_DDNS_IT_MATRIX=1 cargo test --test docker_p2p -- docker_p2p_matrix
 ```
 
 ## Code Style Guidelines

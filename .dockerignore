@@ -1,0 +1,19 @@
+.git
+.claude
+.DS_Store
+
+# Rust / build artifacts
+target
+**/*.rlib
+**/*.rmeta
+
+# Integration test artifacts
+tests/integration/logs
+tests/integration/reports
+tests/integration/volumes
+tests/integration/test-data
+
+# Local editor / OS junk
+**/*.swp
+**/*.tmp
+**/*.log

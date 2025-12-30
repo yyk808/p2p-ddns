@@ -1,6 +1,7 @@
-# 集成测试故障排除（Docker Matrix）
+# 集成测试故障排除（Docker + Rust）
 
-当前集成测试使用 `scripts/p2p-matrix.sh` 按用例动态生成 docker compose，并为每个用例创建独立网络。
+当前集成测试基于 Rust integration tests（`tests/docker_p2p.rs`）并使用 `testcontainers-rs`
+以编程方式创建 Docker 网络与容器。
 
 ## 1) Docker/OrbStack 拉取镜像失败
 
@@ -23,27 +24,31 @@ failed to resolve source metadata ... tls: first record does not look like a TLS
 
 ## 3) 残留的测试资源（容器/网络/卷）
 
-Matrix 默认会清理；但如果使用 `--keep` 或中途 Ctrl+C，可能会残留。
+默认会清理；但如果使用 `P2P_DDNS_IT_KEEP_DOCKER=1` 或中途 Ctrl+C，可能会残留。
 
 ```bash
-./test-integration.sh clean
-# 或
-cd tests/integration && ./quick-test.sh clean
+# 删除残留容器（按名字前缀过滤）
+docker rm -f $(docker ps -aq --filter 'name=p2pddns-it-') 2>/dev/null || true
+
+# 删除残留网络（按名字前缀过滤）
+docker network rm $(docker network ls -q --filter 'name=p2pddns-it-') 2>/dev/null || true
 ```
 
 ## 4) 如何定位某个用例失败
 
 ```bash
-cd tests/integration
-./scripts/p2p-matrix.sh --case two-subnet-3x3 --keep
+# 仅跑 smoke case，并保留 docker 现场（容器/网络）
+P2P_DDNS_IT=1 P2P_DDNS_IT_KEEP_DOCKER=1 cargo test --test docker_p2p -- docker_p2p_smoke -- --nocapture
+
+# 跑 matrix，但只跑某个 case
+P2P_DDNS_IT_MATRIX=1 P2P_DDNS_IT_CASE=partition-recover P2P_DDNS_IT_KEEP_DOCKER=1 \
+  cargo test --test docker_p2p -- docker_p2p_matrix -- --nocapture
 ```
 
-失败时脚本会输出 compose 项目名与 compose 文件路径；你可以用它们查看日志，例如：
+运行时可以用 `docker ps -a` 查看测试创建的容器（前缀 `p2pddns-it-`），并用：
 
-```bash
-docker compose -p <project> -f <compose.yml> logs --tail=200
-docker compose -p <project> -f <compose.yml> exec -T primary-node bash -lc 'ls -la /app/logs && tail -n 120 /app/logs/*.log'
-```
+- `docker logs <container>`
+- `docker exec -it <container> bash`
 
 如果 Docker 连接问题持续存在：
 
@@ -73,7 +78,7 @@ docker images | grep p2p-ddns
 
 1. **查看详细日志**
    ```bash
-   ./quick-test.sh quick --debug 2>&1 | tee test.log
+   P2P_DDNS_IT=1 cargo test --test docker_p2p -- docker_p2p_smoke -- --nocapture 2>&1 | tee test.log
    ```
 
 2. **检查系统环境**
