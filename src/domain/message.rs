@@ -45,6 +45,9 @@ pub(crate) struct SignedMessage {
 }
 
 impl SignedMessage {
+    const MAX_AGE_SECS: u64 = 60;
+    const MAX_FUTURE_SKEW_SECS: u64 = 10;
+
     pub fn decode(bytes: Bytes) -> Result<Self> {
         Ok(postcard::from_bytes(bytes.as_ref())?)
     }
@@ -57,7 +60,10 @@ impl SignedMessage {
     }
 
     pub fn is_fresh(&self, now: u64) -> bool {
-        self.timestamp < now + 10
+        if self.timestamp > now.saturating_add(Self::MAX_FUTURE_SKEW_SECS) {
+            return false;
+        }
+        now.saturating_sub(self.timestamp) <= Self::MAX_AGE_SECS
     }
 
     pub fn sign_and_encode(secret_key: &SecretKey, message: Message) -> Result<Bytes> {

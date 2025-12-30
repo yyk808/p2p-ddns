@@ -33,7 +33,7 @@ pub fn authenticate_and_register(
     auth_req: &AuthRequest,
 ) -> Result<(AuthResponse, Option<EndpointId>)> {
     let ticket_valid = match auth_req.ticket.parse::<Ticket>() {
-        Ok(ticket) => ticket.validate(ctx.ticket.topic(), ctx.ticket.flatten().1),
+        Ok(ticket) => ticket.validate(ctx.ticket.topic(), ctx.ticket.rnum()),
         Err(_) => false,
     };
 
@@ -60,6 +60,20 @@ pub fn authenticate_and_register(
     };
 
     if let Some(pk) = client_pk {
+        if clients.is_client_node(&pk) {
+            return Ok((
+                AuthResponse {
+                    success: true,
+                    error: None,
+                    daemon_public_key: Some(
+                        base64::engine::general_purpose::STANDARD_NO_PAD
+                            .encode(ctx.me.node_id.as_bytes()),
+                    ),
+                },
+                Some(pk as EndpointId),
+            ));
+        }
+
         let client_node = Node {
             node_id: pk,
             invitor: ctx.me.node_id,

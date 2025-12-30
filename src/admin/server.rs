@@ -136,9 +136,13 @@ async fn read_message<T: for<'a> serde::Deserialize<'a>>(
 ) -> Result<T> {
     use tokio::io::AsyncReadExt;
 
+    const MAX_ADMIN_FRAME: usize = 4 * 1024 * 1024;
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_ADMIN_FRAME {
+        anyhow::bail!("admin frame too large: {}", len);
+    }
 
     let mut msg_buf = vec![0u8; len];
     stream.read_exact(&mut msg_buf).await?;

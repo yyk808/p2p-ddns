@@ -92,11 +92,11 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     let db_path = paths::storage_db_path(&args);
     let storage = storage::open_or_create(db_path)?;
-    let (ctx, gos_recv, sp_recv, rnum) = init_network(args.clone(), storage).await?;
+    let (ctx, gos_recv, sp_recv) = init_network(args.clone(), storage).await?;
     let ctx = Arc::new(ctx);
     let clients = Arc::new(ClientRegistry::new());
 
-    info!("Ticket: {}", ctx.ticket);
+    log::debug!("Ticket: {}", ctx.ticket);
     info!("Daemon started");
 
     let socket_path = p2p_ddns::admin::server::default_socket_path();
@@ -132,7 +132,7 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
         }
     });
 
-    ctx.run(gos_recv, sp_recv, rnum).await;
+    ctx.run(gos_recv, sp_recv).await;
     Ok(())
 }
 
@@ -297,6 +297,15 @@ async fn execute_command(
             if let Err(e) = std::fs::write(&ticket_path, &ticket) {
                 log::warn!("Failed to save ticket: {}", e);
             } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&ticket_path) {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(0o600);
+                        let _ = std::fs::set_permissions(&ticket_path, perms);
+                    }
+                }
                 log::info!("Ticket saved to {}", ticket_path.display());
             }
         }
@@ -382,6 +391,9 @@ async fn read_message<T: for<'a> serde::Deserialize<'a>>(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 4 * 1024 * 1024 {
+        anyhow::bail!("admin frame too large: {}", len);
+    }
     let mut msg_buf = vec![0u8; len];
     stream.read_exact(&mut msg_buf).await?;
     Ok(postcard::from_bytes(&msg_buf)?)

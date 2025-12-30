@@ -35,21 +35,18 @@ impl Storage {
             Err(_) => return Ok(T::default()),
         };
 
-        let first_entry = table.first().unwrap();
+        let first_entry = table.first()?;
+        let mut nodes = Vec::new();
         if let Some(first) = first_entry {
-            let range = table.range(first.0.value()..).unwrap();
-            let nodes = range
-                .into_iter()
-                .map(|t| {
-                    let (_, v) = t.unwrap();
-                    postcard::from_bytes(v.value()).unwrap()
-                })
-                .collect::<T>();
-
-            Ok(nodes)
-        } else {
-            Ok(T::default())
+            let range = table.range(first.0.value()..)?;
+            for entry in range {
+                let (_, v) = entry?;
+                let node = postcard::from_bytes(v.value())?;
+                nodes.push(node);
+            }
         }
+
+        Ok(nodes.into_iter().collect::<T>())
     }
 
     pub fn save_node(&self, node: &Node) -> Result<()> {
@@ -59,7 +56,7 @@ impl Storage {
             let mut table = write_txn.open_table(TABLE)?;
 
             let key = node.node_id.to_string();
-            let val = postcard::to_allocvec(node).unwrap();
+            let val = postcard::to_allocvec(node)?;
             let _ = table.insert(key.as_str(), val.as_slice())?;
         }
 
@@ -80,7 +77,7 @@ impl Storage {
             for node in node_iter {
                 let node = node.into();
                 let key = node.node_id.to_string();
-                let val = postcard::to_allocvec(&node).unwrap();
+                let val = postcard::to_allocvec(&node)?;
                 let _ = table.insert(key.to_string().as_str(), val.as_slice())?;
             }
         }
@@ -128,8 +125,8 @@ impl Storage {
         let sk = table.get("sk")?;
 
         if let Some(sk) = sk {
-            let decoded = STANDARD_NO_PAD.decode(sk.value()).unwrap();
-            let bytes: [u8; 32] = decoded.as_slice().try_into().unwrap();
+            let decoded = STANDARD_NO_PAD.decode(sk.value())?;
+            let bytes: [u8; 32] = decoded.as_slice().try_into()?;
             let sk = SecretKey::from_bytes(&bytes);
             let pk = sk.public();
             Ok(Some((pk, sk)))
@@ -146,7 +143,7 @@ impl Storage {
         let write_txn = self.db.begin_write()?;
 
         {
-            let value = postcard::to_allocvec(value.as_ref()).unwrap();
+            let value = postcard::to_allocvec(value.as_ref())?;
             let mut table = write_txn.open_table(CONFIG)?;
             let _ = table.insert(key, value.as_slice())?;
         }
@@ -163,7 +160,7 @@ impl Storage {
 
         {
             let mut table = write_txn.open_table(CONFIG)?;
-            let _ = table.insert(key, postcard::to_allocvec(&value).unwrap().as_slice())?;
+            let _ = table.insert(key, postcard::to_allocvec(&value)?.as_slice())?;
         }
 
         write_txn.commit()?;
@@ -184,7 +181,7 @@ impl Storage {
         let value = table.get(key)?;
 
         if let Some(value) = value {
-            let value = postcard::from_bytes(value.value()).unwrap();
+            let value = postcard::from_bytes(value.value())?;
             Ok(Some(value))
         } else {
             Ok(None)

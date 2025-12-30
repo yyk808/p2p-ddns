@@ -1,0 +1,15 @@
+# Simplified Docker Compose for basic testing
+
+services:
+  test-primary:
+    image: p2p-ddns-test-primary:test
+    container_name: p2p-ddns-test-simple
+    command: ["--help"]
+    environment:
+      - P2P_DDNS_MODE=daemon
+      - P2P_DDNS_PRIMARY=true
+      - P2P_DDNS_LOG_LEVEL=info
+    volumes:
+      - ./test-data:/app/data
+    profiles:
+      - simple-test

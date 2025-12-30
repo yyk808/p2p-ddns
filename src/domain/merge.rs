@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
-use iroh::{EndpointAddr, EndpointId};
+use iroh::{EndpointAddr, EndpointId, TransportAddr};
 
 use crate::domain::node::Node;
 
@@ -9,13 +10,29 @@ pub fn has_ip_addr(addr: &EndpointAddr) -> bool {
 }
 
 pub fn merge_addr(existing: &EndpointAddr, incoming: &EndpointAddr) -> EndpointAddr {
-    if has_ip_addr(incoming) {
+    if existing.id != incoming.id {
         return incoming.clone();
     }
-    if has_ip_addr(existing) {
-        return existing.clone();
+
+    let mut ips = Vec::<SocketAddr>::new();
+    for addr in existing.ip_addrs() {
+        let addr = *addr;
+        if !ips.contains(&addr) {
+            ips.push(addr);
+        }
     }
-    incoming.clone()
+    for addr in incoming.ip_addrs() {
+        let addr = *addr;
+        if !ips.contains(&addr) {
+            ips.push(addr);
+        }
+    }
+
+    if ips.is_empty() {
+        return incoming.clone();
+    }
+
+    EndpointAddr::from_parts(existing.id, ips.into_iter().map(TransportAddr::Ip))
 }
 
 pub fn merge_node(existing: Option<&Node>, incoming: &Node) -> (Node, bool) {
@@ -103,6 +120,23 @@ mod tests {
         let merged = merge_addr(&existing, &incoming);
         assert!(merged.ip_addrs().any(|a| a == &ip));
         Ok(())
+    }
+
+    #[test]
+    fn merge_addr_unions_ip_addrs() {
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2".parse().unwrap();
+        let existing = EndpointAddr::from_parts(pk, [TransportAddr::Ip(a)]);
+        let incoming = EndpointAddr::from_parts(pk, [TransportAddr::Ip(b)]);
+
+        let merged = merge_addr(&existing, &incoming);
+        let mut ips = merged.ip_addrs().copied().collect::<Vec<_>>();
+        ips.sort();
+        assert_eq!(ips, vec![a, b]);
     }
 
     #[test]

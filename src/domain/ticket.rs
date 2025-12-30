@@ -8,7 +8,7 @@ use iroh_gossip::TopicId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::{domain::node::Node, util::time_now};
+use crate::{domain::merge, domain::node::Node, util::time_now};
 
 #[derive(Debug, Clone)]
 pub struct Ticket {
@@ -35,8 +35,22 @@ impl Ticket {
         }
     }
 
+    pub fn from_parts(topic: TopicId, rnum: Vec<u8>, invitor: Node) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(TicketInner {
+                topic,
+                rnum,
+                invitor,
+            })),
+        }
+    }
+
     pub fn topic(&self) -> TopicId {
         self.inner.read().topic
+    }
+
+    pub fn rnum(&self) -> Vec<u8> {
+        self.inner.read().rnum.clone()
     }
 
     pub fn validate(&self, topic: TopicId, rnum: impl AsRef<[u8]>) -> bool {
@@ -51,7 +65,7 @@ impl Ticket {
     pub fn refresh_with(&self, mut invitor: Node, addr: EndpointAddr, now: u64) {
         let mut inner = self.inner.write();
         inner.rnum = rand::random::<[u8; 32]>().to_vec();
-        invitor.addr = addr;
+        invitor.addr = merge::merge_addr(&inner.invitor.addr, &addr);
         invitor.last_heartbeat = now;
         inner.invitor = invitor;
     }
@@ -67,9 +81,13 @@ impl fmt::Display for Ticket {
         log::debug!("Displaying Ticket: {:?}", self.inner);
 
         let inner = self.inner.read();
-        let text = postcard::to_stdvec(&*inner).unwrap();
-        let text = STANDARD_NO_PAD.encode(text);
-        write!(f, "{}", text)
+        match postcard::to_stdvec(&*inner) {
+            Ok(text) => {
+                let text = STANDARD_NO_PAD.encode(text);
+                write!(f, "{}", text)
+            }
+            Err(_) => write!(f, "<ticket-encode-error>"),
+        }
     }
 }
 
@@ -94,7 +112,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use anyhow::Result;
-    use iroh::SecretKey;
+    use iroh::{SecretKey, TransportAddr};
 
     use super::*;
 
@@ -153,5 +171,36 @@ mod tests {
         assert_ne!(rnum_before, rnum_after);
         assert_eq!(invitor_after.addr, new_addr);
         assert_eq!(invitor_after.last_heartbeat, 42);
+    }
+
+    #[test]
+    fn ticket_refresh_with_merges_invitor_addrs() {
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let a: SocketAddr = "10.0.0.1:1111".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2222".parse().unwrap();
+
+        let node = Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::from_parts(pk, [TransportAddr::Ip(a)]),
+            domain: "node".to_string(),
+            services: Default::default(),
+            last_heartbeat: 0,
+        };
+
+        let ticket = Ticket::new(None, node.clone());
+        ticket.refresh_with(
+            node,
+            EndpointAddr::from_parts(pk, [TransportAddr::Ip(b)]),
+            1,
+        );
+
+        let (_, _, invitor) = ticket.flatten();
+        let mut ips = invitor.addr.ip_addrs().copied().collect::<Vec<_>>();
+        ips.sort();
+        assert_eq!(ips, vec![a, b]);
     }
 }

@@ -36,7 +36,7 @@ use crate::{
     },
     net::p2p_protocol::P2Protocol,
     storage::Storage,
-    util::time_now,
+    util::{best_endpoint_addr_for_local, time_now},
 };
 
 #[allow(dead_code)]
@@ -64,13 +64,14 @@ pub struct Context {
     pub args: DaemonArgs,
     pub(crate) pending_auth: DashMap<EndpointId, Auth>,
     started_at: u64,
+    join_announced: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 }
 
 pub async fn init_network(
     args: DaemonArgs,
     storage: Storage,
-) -> Result<(Context, GossipReceiver, Receiver<Bytes>, Option<Vec<u8>>)> {
+) -> Result<(Context, GossipReceiver, Receiver<Bytes>)> {
     // When creating a new network, un-trust all nodes and clear cache.
     if args.primary {
         storage.clear()?;
@@ -92,18 +93,25 @@ pub async fn init_network(
             let mut rng = rand::rng();
             let sk = SecretKey::generate(&mut rng);
             let pk = sk.public();
-            storage.save_secret(sk.clone()).unwrap();
+            if let Err(e) = storage.save_secret(sk.clone()) {
+                log::error!("Failed to persist secret key: {}", e);
+            }
             (pk, sk)
         },
     );
 
     // Set up bootstrap nodes with ticket and storage
-    let arg_ticket = Ticket::from_str(args.ticket.as_deref().unwrap_or(""));
-    let arg_ticket = arg_ticket.map(|t| t.flatten());
-    let has_ticket = arg_ticket.is_ok();
-    let (invitor, invitor_node, invitor_rnum, topic) = arg_ticket
-        .map(|(topic, rnum, node)| (Some(node.node_id), Some(node), Some(rnum), Some(topic)))
-        .unwrap_or((None, None, None, None));
+    let arg_ticket = match args.ticket.as_deref() {
+        Some(ticket) => Some(Ticket::from_str(ticket)?),
+        None => None,
+    };
+    let (invitor, invitor_node) = match arg_ticket.as_ref() {
+        Some(ticket) => {
+            let (_, _, node) = ticket.flatten();
+            (Some(node.node_id), Some(node))
+        }
+        None => (None, None),
+    };
 
     // Set up discovery:
     // - Local discovery (mDNS) is enabled only in daemon mode
@@ -180,20 +188,31 @@ pub async fn init_network(
     log::debug!("My node: {:?}", me);
 
     // Generate a ticket for ourself.
-    let ticket = if has_ticket {
-        storage.save_config_trival::<TopicId>("topic", topic.unwrap())?;
-        Ticket::new(topic, me.clone())
-    } else if args.primary {
-        Ticket::new(None, me.clone())
-    } else if let Ok(Some(topic)) = storage.load_config::<TopicId>("topic") {
-        Ticket::new(Some(topic), me.clone())
+    let ticket = if args.primary {
+        let ticket = Ticket::new(None, me.clone());
+        let (topic, rnum, _) = ticket.flatten();
+        storage.save_config_trival::<TopicId>("topic", topic)?;
+        storage.save_config::<_, Vec<u8>>("ticket_rnum", rnum)?;
+        ticket
+    } else if let Some(ticket) = arg_ticket {
+        let (topic, rnum, _) = ticket.flatten();
+        storage.save_config_trival::<TopicId>("topic", topic)?;
+        storage.save_config::<_, Vec<u8>>("ticket_rnum", rnum)?;
+        ticket
     } else {
-        log::error!(
-            "We need a ticket to join the network, or set [--primary] to create a new network"
-        );
-        return Err(anyhow::anyhow!(
-            "Network config not found in both storage and ticket"
-        ));
+        let topic: Option<TopicId> = storage.load_config("topic")?;
+        let rnum: Option<Vec<u8>> = storage.load_config("ticket_rnum")?;
+        match (topic, rnum) {
+            (Some(topic), Some(rnum)) => Ticket::from_parts(topic, rnum, me.clone()),
+            _ => {
+                log::error!(
+                    "We need a ticket to join the network, or set [--primary] to create a new network"
+                );
+                return Err(anyhow::anyhow!(
+                    "Network config not found in both storage and ticket"
+                ));
+            }
+        }
     };
 
     // Loaded nodes from storage may be outdated
@@ -208,12 +227,12 @@ pub async fn init_network(
 
     // Setting up static discovery with storage
     bootstrap_nodes.iter().for_each(|node| {
-        sp.add_endpoint_info(node.addr.clone());
+        sp.add_endpoint_info(best_endpoint_addr_for_local(&node.addr, &me.addr));
     });
 
     // Setting up static discovery with ticket
     if let Some(node) = invitor_node {
-        sp.set_endpoint_info(node.addr.clone());
+        sp.set_endpoint_info(best_endpoint_addr_for_local(&node.addr, &me.addr));
         bootstrap_nodes.insert(node.node_id, node);
     }
 
@@ -273,10 +292,11 @@ pub async fn init_network(
         args,
         pending_auth: DashMap::new(),
         started_at: time_now(),
+        join_announced: Arc::new(AtomicBool::new(false)),
         paused: Arc::new(AtomicBool::new(false)),
     };
 
-    Ok((context, receiver, msg_receiver, invitor_rnum))
+    Ok((context, receiver, msg_receiver))
 }
 
 async fn wait_for_non_empty_addr(endpoint: &Endpoint) -> EndpointAddr {
@@ -308,38 +328,43 @@ impl Context {
             .unwrap_or(incoming)
     }
 
-    pub async fn run(
-        &self,
-        mut gos_recv: GossipReceiver,
-        mut sp_recv: Receiver<Bytes>,
-        rnum: Option<Vec<u8>>,
-    ) {
-        let mut cron_jobs = interval(std::time::Duration::from_secs(30));
-
-        // before join the loop, we still need to broadcast some message to bootstrap ourself.
-        if self.args.daemon {
-            if let Some(rnum) = rnum {
-                let invited = Message::Invited {
-                    topic: self.ticket.topic(),
-                    rnum,
-                    addr: self.handle.addr(),
-                    alias: self.me.domain.clone(),
-                    services: self.me.services.clone(),
-                };
-                if self.broadcast_message(invited).await.is_err() {
-                    log::error!("Failed to broadcast Invited message to bootstrap the network");
-                }
-            }
-            let about_me = Message::AboutMe {
-                addr: self.handle.addr(),
-                alias: self.me.domain.clone(),
-                services: self.me.services.clone(),
-                invitor: self.me.invitor,
-            };
-            if self.broadcast_message(about_me).await.is_err() && !self.args.primary {
-                log::error!("Failed to broadcast AboutMe message to bootstrap the network");
-            }
+    async fn announce_join(&self) {
+        if self.join_announced.load(Ordering::Relaxed) {
+            return;
         }
+
+        if !self.args.daemon || self.args.primary {
+            return;
+        }
+
+        let invited = Message::Invited {
+            topic: self.ticket.topic(),
+            rnum: self.ticket.rnum(),
+            addr: self.handle.addr(),
+            alias: self.me.domain.clone(),
+            services: self.me.services.clone(),
+        };
+
+        if let Err(e) = self.broadcast_message(invited).await {
+            log::warn!("Failed to announce join (Invited): {e}");
+            return;
+        }
+
+        self.join_announced.store(true, Ordering::Relaxed);
+
+        let about_me = Message::AboutMe {
+            addr: self.handle.addr(),
+            alias: self.me.domain.clone(),
+            services: self.me.services.clone(),
+            invitor: self.me.invitor,
+        };
+        if let Err(e) = self.broadcast_message(about_me).await {
+            log::warn!("Failed to announce join (AboutMe): {e}");
+        }
+    }
+
+    pub async fn run(&self, mut gos_recv: GossipReceiver, mut sp_recv: Receiver<Bytes>) {
+        let mut cron_jobs = interval(std::time::Duration::from_secs(30));
 
         // Errors are expected if we are the first node in network.
         // TODO: a smarter sync strategy
@@ -390,32 +415,10 @@ impl Context {
         &self,
         mut gos_recv: GossipReceiver,
         mut sp_recv: Receiver<Bytes>,
-        rnum: Option<Vec<u8>>,
         duration: Duration,
     ) {
         let deadline = tokio::time::Instant::now() + duration;
         let mut cron_jobs = interval(Duration::from_millis(200));
-
-        if self.args.daemon {
-            if let Some(rnum) = rnum {
-                let invited = Message::Invited {
-                    topic: self.ticket.topic(),
-                    rnum,
-                    addr: self.handle.addr(),
-                    alias: self.me.domain.clone(),
-                    services: self.me.services.clone(),
-                };
-                let _ = self.broadcast_message(invited).await;
-            }
-
-            let about_me = Message::AboutMe {
-                addr: self.handle.addr(),
-                alias: self.me.domain.clone(),
-                services: self.me.services.clone(),
-                invitor: self.me.invitor,
-            };
-            let _ = self.broadcast_message(about_me).await;
-        }
 
         loop {
             tokio::select! {
@@ -526,7 +529,9 @@ impl Context {
                     }
                 }
                 Event::Lagged => log::warn!("Gossip receiver lagged; consider restarting it"),
-                Event::NeighborUp(_) => {}
+                Event::NeighborUp(_) => {
+                    self.announce_join().await;
+                }
             },
             Err(e) => log::error!("Error processing gossip event: {:?}", e),
             _ => {}
@@ -572,7 +577,7 @@ impl Context {
                     addr,
                     domain: alias,
                     services,
-                    last_heartbeat: 0,
+                    last_heartbeat: time_now(),
                 };
 
                 self.pending_auth.remove(&from);
@@ -580,10 +585,7 @@ impl Context {
                 if let Some(node) = self.nodes.get(&from) {
                     self.static_provider.add_endpoint_info(node.addr.clone());
                 }
-                self.ticket
-                    .refresh_from((*self.me).clone(), self.handle.addr());
                 log::info!("Node {} joined the chat", from);
-                log::info!("New Ticket: {}", self.ticket);
             }
             Message::AboutMe {
                 addr,
@@ -607,29 +609,27 @@ impl Context {
                     last_heartbeat: 0,
                 };
 
-                if self.pending_auth.contains_key(&from) {
-                    let auth = self.pending_auth.get(&from).unwrap();
+                if let Some(auth) = self.pending_auth.get(&from) {
                     if auth.introduced {
-                        // We already reveived a message from this node, but it was not introduced.
-                        // Simply update the information.
-                        self.pending_auth.alter(&from, |_, auth| Auth {
-                            introducer: auth.introducer,
-                            introduced: false,
-                            node: auth.node,
-                            timestamp: time_now(),
-                        });
-                    } else {
-                        // This node has been introduced, we can trust it now.
+                        // Introduce already received; trust now.
                         self.pending_auth.remove(&from);
                         self.nodes.insert(from, node);
                         if let Some(node) = self.nodes.get(&from) {
                             self.static_provider.add_endpoint_info(node.addr.clone());
                         }
+                    } else {
+                        // AboutMe repeated before Introduce; keep latest data.
+                        self.pending_auth.alter(&from, |_, auth| Auth {
+                            introducer: auth.introducer,
+                            introduced: false,
+                            node: Box::new(node).into(),
+                            timestamp: time_now(),
+                        });
                     }
                 } else {
-                    // This node has not been introduced yet.
+                    // AboutMe arrived before Introduce.
                     let auth = Auth {
-                        introducer: from,
+                        introducer: invitor,
                         introduced: false,
                         node: Box::new(node).into(),
                         timestamp: time_now(),
@@ -643,23 +643,19 @@ impl Context {
                     return;
                 }
                 log::info!("Received Introduce message from {:?}", from);
-                if self.pending_auth.contains_key(&from) {
-                    let auth = self.pending_auth.get(&from).unwrap();
-                    if auth.introduced {
-                        self.pending_auth.alter(&from, |_, auth| Auth {
-                            introducer: auth.introducer,
-                            introduced: true,
-                            node: auth.node,
-                            timestamp: time_now(),
-                        });
+                if let Some((id, auth)) = self.pending_auth.remove(&invited) {
+                    if let Some(node) = auth.node {
+                        let mut node = *node;
+                        node.addr = self.merge_existing_addr(&id, node.addr.clone());
+                        self.nodes.insert(id, node);
                     } else {
-                        // This node has sent 'AboutMe' message before.
-                        assert!(auth.node.is_some());
-                        if let Some((id, auth)) = self.pending_auth.remove(&from) {
-                            let mut node = *auth.node.unwrap();
-                            node.addr = self.merge_existing_addr(&id, node.addr.clone());
-                            self.nodes.insert(id, node);
-                        }
+                        let auth = Auth {
+                            introducer: from,
+                            introduced: true,
+                            node: None,
+                            timestamp: time_now(),
+                        };
+                        self.pending_auth.insert(invited, auth);
                     }
                 } else {
                     let auth = Auth {
@@ -758,10 +754,11 @@ impl Context {
         }
 
         log::debug!("Sending message to {:?}: {:?}", id, message);
+        let local = self.handle.addr();
         let target = self
             .nodes
             .get(id)
-            .map(|node| node.addr.clone())
+            .map(|node| best_endpoint_addr_for_local(&node.addr, &local))
             .unwrap_or_else(|| (*id).into());
         timeout(
             Duration::from_secs(3),

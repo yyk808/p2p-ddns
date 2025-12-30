@@ -1,0 +1,132 @@
+# p2p-ddns Test Configuration for Specific Scenarios
+# This file extends the main configuration for testing purposes
+
+include:
+  - docker-compose.yml
+
+# Override configurations for testing
+x-common-variables: &common-variables
+  P2P_DDNS_LOG_LEVEL: debug
+  TICKET_WAIT_TIMEOUT: 60
+
+services:
+  # Override primary for testing
+  primary-node:
+    environment:
+      <<: *common-variables
+      P2P_DDNS_MODE: daemon
+      P2P_DDNS_PRIMARY: true
+      P2P_DDNS_DOMAIN: primary-test
+      P2P_DDNS_LOG_LEVEL: debug
+    volumes:
+      - primary-data:/app/data
+      - shared-tickets:/shared
+      - ./logs:/app/logs
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Override daemons for testing
+  daemon-a1:
+    environment:
+      <<: *common-variables
+      NODE_NAME: daemon-a1-test
+      P2P_DDNS_DOMAIN: daemon-a1-test
+      TICKET_WAIT_TIMEOUT: 60
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  daemon-a2:
+    environment:
+      <<: *common-variables
+      NODE_NAME: daemon-a2-test
+      P2P_DDNS_DOMAIN: daemon-a2-test
+      TICKET_WAIT_TIMEOUT: 60
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  daemon-b1:
+    environment:
+      <<: *common-variables
+      NODE_NAME: daemon-b1-test
+      P2P_DDNS_DOMAIN: daemon-b1-test
+      TICKET_WAIT_TIMEOUT: 60
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  daemon-b2:
+    environment:
+      <<: *common-variables
+      NODE_NAME: daemon-b2-test
+      P2P_DDNS_DOMAIN: daemon-b2-test
+      TICKET_WAIT_TIMEOUT: 60
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Test Runner Service
+  test-runner:
+    image: alpine:latest
+    container_name: p2p-ddns-test-runner
+    hostname: test-runner
+    networks:
+      public:
+        ipv4_address: 10.0.0.30
+    volumes:
+      - shared-tickets:/shared:ro
+      - ./logs:/logs:ro
+      - ./scripts:/scripts:ro
+      - ./reports:/reports
+    environment:
+      - TEST_SCENARIO=${TEST_SCENARIO:-basic}
+      - TEST_TIMEOUT=${TEST_TIMEOUT:-300}
+    command: >
+      sh -c "
+        apk add --no-cache iputils-ping net-tools curl jq bash &&
+        chmod +x /scripts/*.sh &&
+        echo 'Starting test runner for scenario: $$TEST_SCENARIO' &&
+        /scripts/test-scenarios.sh --scenario=$$TEST_SCENARIO --timeout=$$TEST_TIMEOUT
+      "
+    depends_on:
+      primary-node:
+        condition: service_healthy
+      daemon-a1:
+        condition: service_healthy
+      daemon-b1:
+        condition: service_healthy
+    profiles:
+      - testing
+
+  # Network Isolation Tester
+  network-tester:
+    image: alpine:latest
+    container_name: p2p-ddns-network-tester
+    hostname: network-tester
+    networks:
+      public:
+        ipv4_address: 10.0.0.31
+    volumes:
+      - ./scripts:/scripts:ro
+    command: >
+      sh -c "
+        apk add --no-cache iputils-ping iptables bash &&
+        chmod +x /scripts/*.sh &&
+        echo 'Network tester ready for manual network manipulation' &&
+        tail -f /dev/null
+      "
+    profiles:
+      - network-testing
+    privileged: true

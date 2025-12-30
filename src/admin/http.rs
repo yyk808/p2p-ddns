@@ -109,6 +109,7 @@ async fn handle_connection(
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<(String, String, HashMap<String, String>, Vec<u8>)> {
+    const MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
     let mut buf = Vec::with_capacity(4096);
     let header_end;
     loop {
@@ -153,7 +154,14 @@ async fn read_http_request(
         .transpose()?
         .unwrap_or(0);
 
+    if content_len > MAX_BODY_SIZE {
+        anyhow::bail!("request body too large");
+    }
+
     let mut body = buf[header_end..].to_vec();
+    if body.len() > MAX_BODY_SIZE {
+        anyhow::bail!("request body too large");
+    }
     while body.len() < content_len {
         let mut chunk = vec![0u8; content_len - body.len()];
         let n = stream.read(&mut chunk).await?;
@@ -161,6 +169,9 @@ async fn read_http_request(
             anyhow::bail!("connection closed while reading body");
         }
         body.extend_from_slice(&chunk[..n]);
+        if body.len() > MAX_BODY_SIZE {
+            anyhow::bail!("request body too large");
+        }
     }
 
     Ok((method, path, headers, body))

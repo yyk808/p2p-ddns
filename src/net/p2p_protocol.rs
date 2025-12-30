@@ -16,6 +16,7 @@ pub struct P2Protocol {
 
 impl P2Protocol {
     pub const P2P_ALPN: &[u8] = b"/iroh-p2p/0";
+    const MAX_MESSAGE_SIZE: u64 = 4 * 1024 * 1024;
 
     pub fn new(msg_sender: Sender<Bytes>) -> Self {
         Self { msg_sender }
@@ -44,6 +45,9 @@ impl P2Protocol {
         let mut incoming_len = [0u8; 8];
         recv.read_exact(&mut incoming_len).await?;
         let len = u64::from_le_bytes(incoming_len);
+        if len > Self::MAX_MESSAGE_SIZE {
+            anyhow::bail!("p2p message too large: {}", len);
+        }
 
         let mut buffer = vec![0u8; len as usize];
         recv.read_exact(&mut buffer).await?;
