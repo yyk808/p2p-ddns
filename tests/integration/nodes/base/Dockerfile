@@ -50,7 +50,6 @@ RUN mkdir -p /app/data /app/logs /app/config /shared && \
 
 # Copy scripts and configurations
 COPY tests/integration/scripts/ /app/scripts/
-COPY tests/integration/configs/ /app/configs/
 
 # Make scripts executable
 RUN chmod +x /app/scripts/*.sh

@@ -34,9 +34,13 @@ cargo doc --no-deps            # Generate documentation
 
 ### Integration Tests
 ```bash
-./test-integration.sh full      # Full test suite
-./test-integration.sh quick     # Quick validation
-cd tests/integration && make test
+./test-integration.sh full      # Build (if needed) + run default matrix suite
+./test-integration.sh quick     # Quick smoke test
+./test-integration.sh clean     # Remove leftover matrix Docker resources
+
+cd tests/integration
+./single-machine-test.sh full
+./scripts/p2p-matrix.sh --list
 ```
 
 ## Code Style Guidelines

@@ -1,426 +1,157 @@
 #!/bin/bash
-
-# Quick test runner for p2p-ddns integration tests
-# This script provides a simple interface to run common test scenarios
+#
+# Quick wrapper for the Docker-based integration matrix.
+#
+# The underlying runner is `scripts/p2p-matrix.sh` which generates docker compose
+# files per case and cleans up by default.
 
 set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-log() {
-    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK-TEST:${NC} $1"
-}
+log() { echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK:${NC} $*"; }
+warn() { echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK WARNING:${NC} $*"; }
+err() { echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK ERROR:${NC} $*" >&2; }
+header() { echo -e "${PURPLE}=== $1 ===${NC}"; }
+info() { echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK:${NC} $*"; }
 
-warn() {
-    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK-TEST WARNING:${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK-TEST ERROR:${NC} $1" >&2
-}
-
-info() {
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] QUICK-TEST INFO:${NC} $1"
-}
-
-header() {
-    echo -e "${PURPLE}=== $1 ===${NC}"
-}
-
-# Show usage
 show_usage() {
-    echo "Usage: $0 [COMMAND] [OPTIONS]"
-    echo
-    echo "Quick test runner for p2p-ddns integration tests"
-    echo
-    echo "Commands:"
-    echo "  quick                 Run quick smoke test"
-    echo "  full                  Run full test suite"
-    echo "  basic                 Run basic functionality test"
-    echo "  network               Run network topology test"
-    echo "  fault                 Run fault recovery test"
-    echo "  build                 Build Docker images"
-    echo "  start                 Start test environment"
-    echo "  stop                  Stop test environment"
-    echo "  status                Show test environment status"
-    echo "  logs                  Show container logs"
-    echo "  clean                 Clean up test environment"
-    echo "  help                  Show this help"
-    echo
-    echo "Options:"
-    echo "  --timeout SECONDS     Test timeout (default: 300)"
-    echo "  --debug               Enable debug logging"
-    echo "  --no-build            Skip building images"
-    echo "  --keep-running       Keep containers running after test"
-    echo
-    echo "Examples:"
-    echo "  $0 quick                    # Quick smoke test"
-    echo "  $0 basic --debug            # Basic test with debug logging"
-    echo "  $0 full --timeout 1800      # Full test suite with 30min timeout"
-    echo "  $0 start && $0 logs         # Start environment and show logs"
+  cat <<'EOF'
+Usage: quick-test.sh [COMMAND] [OPTIONS]
+
+Commands:
+  quick           Smoke test (flat topology)
+  full            Full suite (basic + topology + partition)
+  basic           Basic functionality scenario
+  network         Network topology scenario
+  fault           Fault recovery scenario
+  build           Build Docker images (tag: test)
+  clean           Remove leftover matrix Docker resources
+  help
+
+Options:
+  --timeout SECS  Default: 300
+  --debug         Accepted for compatibility (ignored)
+  --no-build      Skip building images
+EOF
 }
 
-# Parse command line arguments
+require_docker() {
+  command -v docker >/dev/null 2>&1 || { err "docker not found"; exit 1; }
+  docker info >/dev/null 2>&1 || { err "docker daemon not reachable"; exit 1; }
+}
+
 parse_args() {
-    COMMAND=""
-    TIMEOUT=300
-    DEBUG=false
-    BUILD_IMAGES=true
-    KEEP_RUNNING=false
+  COMMAND=""
+  TIMEOUT="300"
+  BUILD_IMAGES="true"
 
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --timeout)
-                TIMEOUT="$2"
-                shift 2
-                ;;
-            --debug)
-                DEBUG=true
-                shift
-                ;;
-            --no-build)
-                BUILD_IMAGES=false
-                shift
-                ;;
-            --keep-running)
-                KEEP_RUNNING=true
-                shift
-                ;;
-            help|--help|-h)
-                show_usage
-                exit 0
-                ;;
-            quick|full|basic|network|fault|build|start|stop|status|logs|clean)
-                if [[ -z "$COMMAND" ]]; then
-                    COMMAND="$1"
-                else
-                    error "Multiple commands specified"
-                    show_usage
-                    exit 1
-                fi
-                shift
-                ;;
-            *)
-                error "Unknown argument: $1"
-                show_usage
-                exit 1
-                ;;
-        esac
-    done
-
-    if [[ -z "$COMMAND" ]]; then
-        COMMAND="quick"
-    fi
-}
-
-# Build Docker images
-cmd_build() {
-    header "Building Docker Images"
-
-    if [[ "$BUILD_IMAGES" == true ]]; then
-        "$SCRIPT_DIR/scripts/build-images-simple.sh" build --tag test
-    else
-        info "Skipping image build as requested"
-    fi
-}
-
-# Start test environment
-cmd_start() {
-    header "Starting Test Environment"
-
-    # Setup networks
-    "$SCRIPT_DIR/networks/create-networks.sh" create
-
-    # Start containers
-    cd "$SCRIPT_DIR"
-    docker-compose up -d
-
-    # Wait for containers to be ready
-    info "Waiting for containers to be ready..."
-    sleep 30
-
-    # Show status
-    cmd_status
-}
-
-# Stop test environment
-cmd_stop() {
-    header "Stopping Test Environment"
-
-    cd "$SCRIPT_DIR"
-    if docker-compose ps -q | grep -q .; then
-        docker-compose down
-    fi
-
-    info "Test environment stopped"
-}
-
-# Show test environment status
-cmd_status() {
-    header "Test Environment Status"
-
-    cd "$SCRIPT_DIR"
-
-    echo "Docker Networks:"
-    docker network ls | grep -E "(subnet-a|subnet-b|public)" || echo "  No test networks found"
-    echo
-
-    echo "Container Status:"
-    docker-compose ps
-    echo
-
-    echo "Recent Logs (last 10 lines):"
-    for service in primary-node daemon-a1 daemon-b1; do
-        if docker-compose ps --format "{{.Name}}" | grep -q "$service"; then
-            echo "=== $service ==="
-            docker-compose logs --tail=5 "$service" 2>/dev/null | tail -3 || echo "  No recent logs"
-            echo
-        fi
-    done
-}
-
-# Show container logs
-cmd_logs() {
-    cd "$SCRIPT_DIR"
-
-    if [[ "$DEBUG" == true ]]; then
-        docker-compose logs -f
-    else
-        docker-compose logs -f --tail=50
-    fi
-}
-
-# Clean up test environment
-cmd_clean() {
-    header "Cleaning Up Test Environment"
-
-    # Stop containers
-    cmd_stop
-
-    # Clean up networks
-    "$SCRIPT_DIR/networks/cleanup-networks.sh" normal
-
-    # Clean up any test artifacts
-    if [[ -d "$SCRIPT_DIR/logs" ]]; then
-        find "$SCRIPT_DIR/logs" -name "*.log" -mtime +1 -delete 2>/dev/null || true
-    fi
-
-    if [[ -d "$SCRIPT_DIR/reports" ]]; then
-        find "$SCRIPT_DIR/reports" -name "*" -mtime +7 -delete 2>/dev/null || true
-    fi
-
-    info "Test environment cleaned up"
-}
-
-# Run quick smoke test
-cmd_quick() {
-    header "Quick Smoke Test"
-
-    cmd_build
-
-    local log_level="info"
-    if [[ "$DEBUG" == true ]]; then
-        log_level="debug"
-    fi
-
-    # Run basic functionality test
-    if "$SCRIPT_DIR/scripts/test-scenarios.sh" \
-        --scenario basic-functionality \
-        --timeout "$TIMEOUT" \
-        --log-level "$log_level"; then
-
-        log "Quick smoke test PASSED"
-
-        if [[ "$KEEP_RUNNING" == false ]]; then
-            cmd_clean
-        fi
-    else
-        error "Quick smoke test FAILED"
-        exit 1
-    fi
-}
-
-# Run full test suite
-cmd_full() {
-    header "Full Test Suite"
-
-    cmd_build
-
-    local log_level="info"
-    if [[ "$DEBUG" == true ]]; then
-        log_level="debug"
-    fi
-
-    if ! "$SCRIPT_DIR/scripts/test-scenarios.sh" \
-        --scenario basic-functionality \
-        --timeout "$TIMEOUT" \
-        --log-level "$log_level"; then
-        error "Scenario FAILED: basic-functionality"
-        exit 1
-    fi
-
-    if ! "$SCRIPT_DIR/scripts/test-scenarios.sh" \
-        --scenario network-topology \
-        --timeout "$TIMEOUT" \
-        --log-level "$log_level"; then
-        error "Scenario FAILED: network-topology"
-        exit 1
-    fi
-
-    if ! "$SCRIPT_DIR/scripts/test-scenarios.sh" \
-        --scenario fault-recovery \
-        --timeout "$TIMEOUT" \
-        --log-level "$log_level"; then
-        error "Scenario FAILED: fault-recovery"
-        exit 1
-    fi
-
-    log "Full test suite PASSED"
-
-    if [[ "$KEEP_RUNNING" == false ]]; then
-        cmd_clean
-    fi
-}
-
-# Run specific test scenarios
-cmd_basic() {
-    header "Basic Functionality Test"
-
-    cmd_build
-
-    local log_level="info"
-    if [[ "$DEBUG" == true ]]; then
-        log_level="debug"
-    fi
-
-    if "$SCRIPT_DIR/scripts/test-scenarios.sh" \
-        --scenario basic-functionality \
-        --timeout "$TIMEOUT" \
-        --log-level "$log_level"; then
-
-        log "Basic functionality test PASSED"
-
-        if [[ "$KEEP_RUNNING" == false ]]; then
-            cmd_clean
-        fi
-    else
-        error "Basic functionality test FAILED"
-        exit 1
-    fi
-}
-
-cmd_network() {
-    header "Network Topology Test"
-
-    cmd_build
-
-    local log_level="info"
-    if [[ "$DEBUG" == true ]]; then
-        log_level="debug"
-    fi
-
-    if "$SCRIPT_DIR/scripts/test-scenarios.sh" \
-        --scenario network-topology \
-        --timeout "$TIMEOUT" \
-        --log-level "$log_level"; then
-
-        log "Network topology test PASSED"
-
-        if [[ "$KEEP_RUNNING" == false ]]; then
-            cmd_clean
-        fi
-    else
-        error "Network topology test FAILED"
-        exit 1
-    fi
-}
-
-cmd_fault() {
-    header "Fault Recovery Test"
-
-    cmd_build
-
-    local log_level="info"
-    if [[ "$DEBUG" == true ]]; then
-        log_level="debug"
-    fi
-
-    if "$SCRIPT_DIR/scripts/test-scenarios.sh" \
-        --scenario fault-recovery \
-        --timeout "$TIMEOUT" \
-        --log-level "$log_level"; then
-
-        log "Fault recovery test PASSED"
-
-        if [[ "$KEEP_RUNNING" == false ]]; then
-            cmd_clean
-        fi
-    else
-        error "Fault recovery test FAILED"
-        exit 1
-    fi
-}
-
-# Main execution
-main() {
-    parse_args "$@"
-
-    header "p2p-ddns Quick Test Runner"
-    echo "Command: $COMMAND"
-    echo "Timeout: ${TIMEOUT}s"
-    echo "Debug: $DEBUG"
-    echo
-
-    case "$COMMAND" in
-        build)
-            cmd_build
-            ;;
-        start)
-            cmd_start
-            ;;
-        stop)
-            cmd_stop
-            ;;
-        status)
-            cmd_status
-            ;;
-        logs)
-            cmd_logs
-            ;;
-        clean)
-            cmd_clean
-            ;;
-        quick)
-            cmd_quick
-            ;;
-        full)
-            cmd_full
-            ;;
-        basic)
-            cmd_basic
-            ;;
-        network)
-            cmd_network
-            ;;
-        fault)
-            cmd_fault
-            ;;
-        *)
-            error "Unknown command: $COMMAND"
-            show_usage
-            exit 1
-            ;;
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout) TIMEOUT="${2:?missing --timeout value}"; shift 2 ;;
+      --debug) shift ;; # ignored; p2p-matrix uses fixed per-role log levels
+      --no-build) BUILD_IMAGES="false"; shift ;;
+      help|--help|-h) show_usage; exit 0 ;;
+      quick|full|basic|network|fault|build|clean)
+        [[ -z "$COMMAND" ]] || { err "multiple commands specified"; exit 2; }
+        COMMAND="$1"
+        shift
+        ;;
+      *) err "unknown arg: $1"; show_usage; exit 2 ;;
     esac
+  done
+
+  [[ -n "$COMMAND" ]] || COMMAND="quick"
 }
 
-# Run main function with all arguments
+cmd_build() {
+  header "Building Docker Images"
+  require_docker
+  if [[ "$BUILD_IMAGES" == "true" ]]; then
+    "$SCRIPT_DIR/scripts/build-images-simple.sh" build --tag test
+  else
+    info "Skipping image build (--no-build)"
+  fi
+}
+
+cmd_clean() {
+  header "Cleaning Matrix Resources"
+  require_docker
+
+  local removed="0"
+
+  while read -r id name; do
+    [[ -n "${id:-}" && -n "${name:-}" ]] || continue
+    if [[ "$name" == p2pddns_it_* ]]; then
+      docker rm -f "$id" >/dev/null 2>&1 || true
+      removed=$((removed + 1))
+    fi
+  done < <(docker ps -a --format '{{.ID}} {{.Names}}')
+
+  while read -r id name; do
+    [[ -n "${id:-}" && -n "${name:-}" ]] || continue
+    if [[ "$name" == p2pddns_it_* ]]; then
+      docker network rm "$id" >/dev/null 2>&1 || true
+    fi
+  done < <(docker network ls --format '{{.ID}} {{.Name}}')
+
+  while read -r name; do
+    [[ -n "${name:-}" ]] || continue
+    if [[ "$name" == p2pddns_it_*_tickets ]]; then
+      docker volume rm "$name" >/dev/null 2>&1 || true
+    fi
+  done < <(docker volume ls --format '{{.Name}}')
+
+  log "Cleanup done (removed containers: $removed)"
+}
+
+run_scenario() {
+  local scenario="$1"
+  "$SCRIPT_DIR/scripts/test-scenarios.sh" --scenario "$scenario" --timeout "$TIMEOUT"
+}
+
+main() {
+  parse_args "$@"
+
+  case "$COMMAND" in
+    build) cmd_build ;;
+    clean) cmd_clean ;;
+    quick)
+      header "Quick Smoke Test"
+      cmd_build
+      run_scenario basic-functionality
+      ;;
+    basic)
+      header "Basic Functionality"
+      cmd_build
+      run_scenario basic-functionality
+      ;;
+    network)
+      header "Network Topology"
+      cmd_build
+      run_scenario network-topology
+      ;;
+    fault)
+      header "Fault Recovery"
+      cmd_build
+      run_scenario fault-recovery
+      ;;
+    full)
+      header "Full Suite"
+      cmd_build
+      run_scenario basic-functionality
+      run_scenario network-topology
+      run_scenario fault-recovery
+      ;;
+    *) err "unknown command: $COMMAND"; exit 2 ;;
+  esac
+}
+
 main "$@"

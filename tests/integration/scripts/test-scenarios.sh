@@ -3,7 +3,7 @@
 # Scenario runner for p2p-ddns integration tests.
 #
 # This is a thin wrapper around `scripts/p2p-matrix.sh` so existing entry points
-# (quick-test.sh, run-tests.sh, single-machine-test.sh) stay usable.
+# (quick-test.sh, single-machine-test.sh) stay usable.
 
 set -euo pipefail
 

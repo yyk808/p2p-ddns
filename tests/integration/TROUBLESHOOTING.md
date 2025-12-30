@@ -1,203 +1,49 @@
-# 集成测试故障排除指南
+# 集成测试故障排除（Docker Matrix）
 
-## 常见问题
+当前集成测试使用 `scripts/p2p-matrix.sh` 按用例动态生成 docker compose，并为每个用例创建独立网络。
 
-### 1. Docker 连接问题
+## 1) Docker/OrbStack 拉取镜像失败
 
-#### 错误信息
+常见报错（Docker Hub 连接/TLS）：
+
 ```
-ERROR: failed to solve: debian:bookworm-slim: failed to resolve source metadata for docker.io/library/debian:bookworm-slim: failed to do request: Head "https://registry-1.docker.io/v2/library/debian/manifests/bookworm-slim": tls: first record does not look like a TLS handshake
+failed to resolve source metadata ... tls: first record does not look like a TLS handshake
 ```
 
-#### 解决方案
+建议：
 
-**方案A: 重启 OrbStack**
+- macOS + OrbStack：重启 OrbStack 后重试
+- 检查是否能访问 Docker Hub：`curl -I https://registry-1.docker.io/v2/`
+- 清理磁盘空间（镜像/层缓存过多）：`docker system prune -a`
+
+## 2) Docker 权限/daemon 不可用
+
+- 确认 `docker info` 可运行
+- Linux：确认用户在 `docker` 组，或用 `sudo` 运行（按你的系统策略）
+
+## 3) 残留的测试资源（容器/网络/卷）
+
+Matrix 默认会清理；但如果使用 `--keep` 或中途 Ctrl+C，可能会残留。
+
 ```bash
-# 重启 OrbStack
-# 在菜单栏点击 OrbStack 图标 -> Restart
+./test-integration.sh clean
+# 或
+cd tests/integration && ./quick-test.sh clean
 ```
 
-**方案B: 检查网络连接**
+## 4) 如何定位某个用例失败
+
 ```bash
-# 检查能否访问 Docker Hub
-curl -I https://registry-1.docker.io/v2/
-
-# 如果失败，可能是网络代理或防火墙问题
-```
-
-**方案C: 重置 Docker 网络配置**
-```bash
-# 停止 OrbStack
-# 重启网络服务
-# 重新启动 OrbStack
-```
-
-**方案D: 使用本地镜像（如果可用）**
-```bash
-# 检查是否有可用的本地镜像
-docker images
-
-# 如果有基础镜像，可以修改构建脚本跳过网络拉取
-```
-
-### 2. 权限问题
-
-#### 错误信息
-```
-permission denied: ./tests/integration/Makefile
-```
-
-#### 解决方案
-```bash
-# 修复脚本权限
-chmod +x tests/integration/*.sh
-chmod +x tests/integration/networks/*.sh
-chmod +x tests/integration/quick-test.sh
-chmod +x tests/integration/test-integration.sh
-
-# 或者使用 make 进行设置
 cd tests/integration
-make setup
+./scripts/p2p-matrix.sh --case two-subnet-3x3 --keep
 ```
 
-### 3. 容器启动失败
+失败时脚本会输出 compose 项目名与 compose 文件路径；你可以用它们查看日志，例如：
 
-#### 错误信息
-```
-container cannot join network: not found
-```
-
-#### 解决方案
 ```bash
-# 清理网络状态
-cd tests/integration
-./networks/cleanup-networks.sh force
-
-# 重新创建网络
-./networks/create-networks.sh create
+docker compose -p <project> -f <compose.yml> logs --tail=200
+docker compose -p <project> -f <compose.yml> exec -T primary-node bash -lc 'ls -la /app/logs && tail -n 120 /app/logs/*.log'
 ```
-
-### 4. 端口冲突
-
-#### 错误信息
-```
-port is already allocated
-```
-
-#### 解决方案
-```bash
-# 检查端口占用
-lsof -i :8080
-lsof -i :8081
-# 等等...
-
-# 停止占用端口的进程
-sudo kill -9 <PID>
-
-# 或者修改 docker-compose.yml 中的端口映射
-```
-
-### 5. 内存不足
-
-#### 错误信息
-```
-no space left on device
-```
-
-#### 解决方案
-```bash
-# 清理 Docker 资源
-docker system prune -a
-docker volume prune
-docker network prune
-
-# 检查磁盘空间
-df -h
-```
-
-## 环境特定问题
-
-### OrbStack 用户 (macOS)
-
-OrbStack 有时会遇到网络连接问题：
-
-1. **重启 OrbStack**
-   - 点击菜单栏的 OrbStack 图标
-   - 选择 "Restart"
-
-2. **检查系统代理设置**
-   - 系统偏好设置 -> 网络 -> 高级 -> 代理
-   - 确保代理设置正确
-
-3. **重置网络配置**
-   ```bash
-   # 重启 OrbStack 后尝试
-   docker pull hello-world
-   ```
-
-### Docker Desktop 用户
-
-1. **重启 Docker Desktop**
-2. **检查 Docker Desktop 设置**
-   - 确保有足够的内存分配
-   - 检查网络设置
-
-### Linux 用户
-
-1. **检查 Docker 服务状态**
-   ```bash
-   sudo systemctl status docker
-   sudo systemctl restart docker
-   ```
-
-2. **检查用户权限**
-   ```bash
-   sudo usermod -aG docker $USER
-   # 注销并重新登录
-   ```
-
-## 调试技巧
-
-### 1. 启用调试模式
-```bash
-# 启用详细日志
-./quick-test.sh quick --debug
-
-# 查看构建详情
-docker build --no-cache --progress=plain .
-```
-
-### 2. 逐步调试
-```bash
-# 只构建镜像
-./quick-test.sh build
-
-# 只启动环境
-./quick-test.sh start
-
-# 查看状态
-./quick-test.sh status
-```
-
-### 3. 检查日志
-```bash
-# 查看容器日志
-./quick-test.sh logs
-
-# 查看特定容器日志
-docker-compose logs primary-node
-```
-
-### 4. 进入容器调试
-```bash
-# 进入容器
-docker-compose exec primary-node /bin/bash
-
-# 检查进程
-docker-compose exec primary-node ps aux
-```
-
-## 替代方案
 
 如果 Docker 连接问题持续存在：
 
