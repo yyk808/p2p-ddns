@@ -26,23 +26,35 @@ error() {
 wait_for_network() {
     log "Waiting for network to be ready..."
 
-    # Wait for network interface to be up
-    local retries=30
+    # Multi-homed test cases attach extra Docker networks after container creation.
+    # Wait until we see the expected number of IPv4 addresses before starting p2p-ddns so the
+    # generated ticket includes all reachable interfaces.
+    local expected_ipv4="${P2P_DDNS_EXPECT_IPV4:-1}"
+    local retries=60
     while [[ $retries -gt 0 ]]; do
-        # Check for default route using either ip or route command
-        if command -v ip >/dev/null 2>&1 && ip route show default >/dev/null 2>&1; then
-            log "Network is ready (ip command)"
-            break
-        elif command -v route >/dev/null 2>&1 && route | grep -q "default"; then
-            log "Network is ready (route command)"
-            break
+        local ipv4_count=0
+        if [[ -x /sbin/ifconfig ]]; then
+            ipv4_count=$(/sbin/ifconfig 2>/dev/null | awk '$1 == "inet" && $2 !~ /^127\\./ { c++ } END { print c+0 }')
+        else
+            # Fallback: hostname -i may only show the primary address, but it's better than nothing.
+            local ips
+            ips=$(hostname -i 2>/dev/null || true)
+            for ip in $ips; do
+                if [[ "$ip" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ && "$ip" != 127.* ]]; then
+                    ((ipv4_count++))
+                fi
+            done
+        fi
+        if [[ $ipv4_count -ge $expected_ipv4 ]]; then
+            log "Network is ready (ipv4 addresses: ${ipv4_count}/${expected_ipv4})"
+            return 0
         fi
         sleep 1
         ((retries--))
     done
 
     if [[ $retries -eq 0 ]]; then
-        warn "Network check timeout, proceeding anyway..."
+        warn "Network check timeout (ipv4 addresses < ${expected_ipv4}), proceeding anyway..."
         # Don't exit - just log and continue
     fi
 }
@@ -129,26 +141,40 @@ main() {
 
     log "Starting p2p-ddns with arguments: ${ARGS[*]}"
 
-    # Start p2p-ddns in background
     mkdir -p /app/logs
-    /usr/local/bin/p2p-ddns "${ARGS[@]}" > /app/logs/primary.log 2>&1 &
-    PID=$!
+    touch /app/logs/primary.log
 
-    # Stream logs to stdout for easier debugging from `docker logs`.
-    tail -n 0 -F /app/logs/primary.log &
-    TAIL_PID=$!
+    # Preserve original stdout/stderr so we can dump logs without re-feeding them into tee.
+    exec 3>&1 4>&2
+
+    # Mirror all stdout/stderr into the log file while still keeping `docker logs` useful.
+    exec > >(tee -a /app/logs/primary.log) 2>&1
+
+    log "p2p-ddns --version:"
+    /usr/local/bin/p2p-ddns --version || true
+
+    # Start p2p-ddns in background
+    /usr/local/bin/p2p-ddns "${ARGS[@]}" &
+    PID=$!
 
     # Monitor the ticket and keep /shared/ticket.txt up-to-date.
     monitor_ticket &
     MONITOR_PID=$!
 
     # Wait for process (keep it running)
+    set +e
     wait $PID 2>/dev/null
+    EXIT_CODE=$?
+    set -e
 
-    kill "$TAIL_PID" 2>/dev/null || true
     kill "$MONITOR_PID" 2>/dev/null || true
 
-    log "Primary node stopped (exit code: $?)"
+    echo "----- PRIMARY: /app/logs/primary.log (tail -n 200) -----" >&3
+    tail -n 200 /app/logs/primary.log 2>/dev/null >&3 || true
+    echo "--------------------------------------------------------" >&3
+
+    log "Primary node stopped (exit code: $EXIT_CODE)"
+    exit "$EXIT_CODE"
 }
 
 # Run main function with all arguments

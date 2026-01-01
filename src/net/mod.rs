@@ -1,6 +1,7 @@
 pub mod p2p_protocol;
 
 use std::{
+    io::IsTerminal,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str::FromStr,
     sync::Arc,
@@ -22,6 +23,7 @@ use iroh::{
 use iroh_gossip::{
     ALPN, Gossip, TopicId,
     api::{Event, GossipReceiver, GossipSender},
+    proto::HyparviewConfig,
 };
 use rand::{Rng, distr::Alphanumeric};
 use tokio::time::{interval, timeout};
@@ -169,7 +171,16 @@ pub async fn init_network(
     let endpoint_addr = wait_for_non_empty_addr(&endpoint).await;
 
     let (msg_sender, msg_receiver) = futures::channel::mpsc::channel(1024);
-    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let mut membership = HyparviewConfig::default();
+    if args.primary {
+        // The default HyParView active view size (5) can prevent all daemons from joining in
+        // multi-subnet deployments where the primary is the only routable bridge between networks.
+        membership.active_view_capacity = 32;
+        membership.passive_view_capacity = 128;
+    }
+    let gossip = Gossip::builder()
+        .membership_config(membership)
+        .spawn(endpoint.clone());
     let p2p = P2Protocol::new(msg_sender);
     let router = RouterBuilder::new(endpoint.clone())
         .accept(ALPN, gossip.clone())
@@ -296,6 +307,10 @@ pub async fn init_network(
         paused: Arc::new(AtomicBool::new(false)),
     };
 
+    if context.args.daemon && !context.args.primary {
+        context.announce_join().await;
+    }
+
     Ok((context, receiver, msg_receiver))
 }
 
@@ -365,6 +380,29 @@ impl Context {
 
     pub async fn run(&self, mut gos_recv: GossipReceiver, mut sp_recv: Receiver<Bytes>) {
         let mut cron_jobs = interval(std::time::Duration::from_secs(30));
+        let interactive = std::io::stdin().is_terminal();
+        let mut ctrlc = Box::pin(tokio::signal::ctrl_c()).fuse();
+        let mut sigterm = Box::pin(async {
+            #[cfg(unix)]
+            {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut signal) => {
+                        let _ = signal.recv().await;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to listen for SIGTERM signal: {e}; continuing without SIGTERM handling"
+                        );
+                        futures::future::pending::<()>().await;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                futures::future::pending::<()>().await;
+            }
+        })
+        .fuse();
 
         // Errors are expected if we are the first node in network.
         // TODO: a smarter sync strategy
@@ -374,12 +412,30 @@ impl Context {
         let _ = self.broadcast_neighbor_message(sync_req).await;
 
         loop {
-            let ctrlc = tokio::signal::ctrl_c().fuse();
-            let ctrlc = std::pin::pin!(ctrlc);
-
             futures::select! {
-                _ = ctrlc.fuse() => {
-                    log::info!("Shutting down...");
+                res = ctrlc => {
+                    match res {
+                        Ok(()) => {
+                            if self.args.daemon && !interactive {
+                                // In daemon/container scenarios stdout/stderr are usually not
+                                // attached to a TTY. Treat SIGINT as non-fatal to avoid
+                                // accidental shutdown from signal proxying.
+                                log::warn!(
+                                    "Received SIGINT in non-interactive daemon mode; ignoring (use SIGTERM or admin shutdown)"
+                                );
+                            } else {
+                                log::info!("Shutting down (SIGINT)...");
+                                self.graceful_shutdown().await;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to listen for Ctrl-C signal: {e}; continuing without signal handling");
+                        }
+                    }
+                },
+                _ = sigterm => {
+                    log::info!("Shutting down (SIGTERM)...");
                     self.graceful_shutdown().await;
                     break;
                 },
@@ -677,13 +733,13 @@ impl Context {
             Message::SyncRequest { nodes } => {
                 if !self.args.daemon || passed {
                     for node in nodes {
-                        let existing = self.nodes.get(&node.node_id);
+                        let existing = self.nodes.get(&node.node_id).map(|it| it.value().clone());
                         let should_update = match existing.as_ref() {
                             None => true,
                             Some(existing) => existing.last_heartbeat < node.last_heartbeat,
                         };
                         if should_update {
-                            let (merged, _) = merge::merge_node(existing.as_deref(), &node);
+                            let (merged, _) = merge::merge_node(existing.as_ref(), &node);
                             self.static_provider.add_endpoint_info(merged.addr.clone());
                             self.nodes.insert(merged.node_id, merged);
                         }
@@ -709,13 +765,13 @@ impl Context {
                 // Or if we are a client, we simply trust everything.
                 if !self.args.daemon || passed {
                     for node in nodes {
-                        let existing = self.nodes.get(&node.node_id);
+                        let existing = self.nodes.get(&node.node_id).map(|it| it.value().clone());
                         let should_update = match existing.as_ref() {
                             None => true,
                             Some(existing) => existing.last_heartbeat < node.last_heartbeat,
                         };
                         if should_update {
-                            let (merged, _) = merge::merge_node(existing.as_deref(), &node);
+                            let (merged, _) = merge::merge_node(existing.as_ref(), &node);
                             self.static_provider.add_endpoint_info(merged.addr.clone());
                             self.nodes.insert(merged.node_id, merged);
                         }

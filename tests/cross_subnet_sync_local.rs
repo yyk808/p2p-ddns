@@ -1,8 +1,4 @@
-use std::{
-    net::{SocketAddr, SocketAddrV4},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use p2p_ddns::{
@@ -35,7 +31,6 @@ async fn make_storage() -> Result<Storage> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires UDP socket binding permissions (iroh endpoint)"]
 async fn test_cross_subnet_like_sync_learns_all_ips() -> Result<()> {
     // Primary A
     let storage_a = make_storage().await?;
@@ -76,29 +71,65 @@ async fn test_cross_subnet_like_sync_learns_all_ips() -> Result<()> {
 
     let _ = tokio::join!(h_a, h_b, h_c);
 
-    // Build expected advertised addresses.
-    let addr_a: SocketAddrV4 = "127.0.0.1:18080".parse().unwrap();
-    let addr_b: SocketAddrV4 = "127.0.0.1:18081".parse().unwrap();
-    let addr_c: SocketAddrV4 = "127.0.0.1:18082".parse().unwrap();
-    let addr_a = SocketAddr::V4(addr_a);
-    let addr_b = SocketAddr::V4(addr_b);
-    let addr_c = SocketAddr::V4(addr_c);
+    fn has_any_advertised_addr(
+        learned: &p2p_ddns::domain::node::Node,
+        advertised: &[SocketAddr],
+    ) -> bool {
+        learned
+            .addr
+            .ip_addrs()
+            .any(|a| advertised.iter().any(|b| b == a))
+    }
 
     // Each node should learn about the other nodes and have usable IP addresses for them.
+    let advertised_a: Vec<SocketAddr> = ctx_a.handle.addr().ip_addrs().copied().collect();
+    let advertised_b: Vec<SocketAddr> = ctx_b.handle.addr().ip_addrs().copied().collect();
+    let advertised_c: Vec<SocketAddr> = ctx_c.handle.addr().ip_addrs().copied().collect();
+
     let b_from_a = ctx_a.nodes.get(&node_b).expect("A should learn B");
-    assert!(b_from_a.addr.ip_addrs().any(|a| a == &addr_b));
+    assert!(
+        has_any_advertised_addr(&b_from_a, &advertised_b),
+        "A learned B but addr={:?}, expected one of {:?}",
+        b_from_a.addr,
+        advertised_b
+    );
     let c_from_a = ctx_a.nodes.get(&node_c).expect("A should learn C");
-    assert!(c_from_a.addr.ip_addrs().any(|a| a == &addr_c));
+    assert!(
+        has_any_advertised_addr(&c_from_a, &advertised_c),
+        "A learned C but addr={:?}, expected one of {:?}",
+        c_from_a.addr,
+        advertised_c
+    );
 
     let a_from_b = ctx_b.nodes.get(&node_a).expect("B should learn A");
-    assert!(a_from_b.addr.ip_addrs().any(|a| a == &addr_a));
+    assert!(
+        has_any_advertised_addr(&a_from_b, &advertised_a),
+        "B learned A but addr={:?}, expected one of {:?}",
+        a_from_b.addr,
+        advertised_a
+    );
     let c_from_b = ctx_b.nodes.get(&node_c).expect("B should learn C");
-    assert!(c_from_b.addr.ip_addrs().any(|a| a == &addr_c));
+    assert!(
+        has_any_advertised_addr(&c_from_b, &advertised_c),
+        "B learned C but addr={:?}, expected one of {:?}",
+        c_from_b.addr,
+        advertised_c
+    );
 
     let a_from_c = ctx_c.nodes.get(&node_a).expect("C should learn A");
-    assert!(a_from_c.addr.ip_addrs().any(|a| a == &addr_a));
+    assert!(
+        has_any_advertised_addr(&a_from_c, &advertised_a),
+        "C learned A but addr={:?}, expected one of {:?}",
+        a_from_c.addr,
+        advertised_a
+    );
     let b_from_c = ctx_c.nodes.get(&node_b).expect("C should learn B");
-    assert!(b_from_c.addr.ip_addrs().any(|a| a == &addr_b));
+    assert!(
+        has_any_advertised_addr(&b_from_c, &advertised_b),
+        "C learned B but addr={:?}, expected one of {:?}",
+        b_from_c.addr,
+        advertised_b
+    );
 
     Ok(())
 }

@@ -38,10 +38,10 @@ docker network rm $(docker network ls -q --filter 'name=p2pddns-it-') 2>/dev/nul
 
 ```bash
 # 仅跑 smoke case，并保留 docker 现场（容器/网络）
-P2P_DDNS_IT=1 P2P_DDNS_IT_KEEP_DOCKER=1 cargo test --test docker_p2p -- docker_p2p_smoke -- --nocapture
+P2P_DDNS_IT_KEEP_DOCKER=1 cargo test --test docker_p2p -- docker_p2p_smoke -- --nocapture
 
 # 跑 matrix，但只跑某个 case
-P2P_DDNS_IT_MATRIX=1 P2P_DDNS_IT_CASE=partition-recover P2P_DDNS_IT_KEEP_DOCKER=1 \
+P2P_DDNS_IT_CASE=partition-recover P2P_DDNS_IT_KEEP_DOCKER=1 \
   cargo test --test docker_p2p -- docker_p2p_matrix -- --nocapture
 ```
 

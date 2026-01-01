@@ -37,6 +37,7 @@ cargo doc --no-deps            # Generate documentation
 # Docker-based P2P tests (testcontainers-rs)
 P2P_DDNS_IT=1 cargo test --test docker_p2p -- docker_p2p_smoke
 P2P_DDNS_IT_MATRIX=1 cargo test --test docker_p2p
+P2P_DDNS_IT_NEGATIVE=1 cargo test --test docker_p2p -- docker_p2p_expected_failures
 
 # Useful toggles
 P2P_DDNS_IT_SUBNETS=2 P2P_DDNS_IT_DAEMONS=10 P2P_DDNS_IT=1 cargo test --test docker_p2p -- docker_p2p_smoke
