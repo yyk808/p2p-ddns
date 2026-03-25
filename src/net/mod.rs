@@ -3,6 +3,7 @@ pub mod p2p_protocol;
 use std::{
     io::IsTerminal,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
@@ -23,17 +24,20 @@ use iroh_gossip::{
     api::{Event, GossipReceiver, GossipSender},
     proto::HyparviewConfig,
 };
+use parking_lot::RwLock;
 use rand::{Rng, distr::Alphanumeric};
 use tokio::time::{interval, timeout};
 
 use crate::{
     cli::args::{DaemonArgs, RelayModeArg},
     domain::{
+        client::HostsSyncStatus,
         merge,
         message::{Message, SignedMessage},
         node::Node,
         ticket::Ticket,
     },
+    hosts,
     net::p2p_protocol::P2Protocol,
     storage::Storage,
     util::{best_endpoint_addr_for_local, time_now},
@@ -66,6 +70,7 @@ pub struct Context {
     started_at: u64,
     join_announced: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    hosts_sync: Arc<RwLock<HostsSyncStatus>>,
 }
 
 pub async fn init_network(
@@ -415,6 +420,15 @@ fallback attempts: {:#?}",
             .map(|alias| UserData::from_str(alias.as_str()).unwrap()),
     );
 
+    let hosts_sync = Arc::new(RwLock::new(HostsSyncStatus {
+        enabled: args.hosts_sync,
+        path: hosts_sync_path(&args).map(|p| p.display().to_string()),
+        cleanup_on_shutdown: args.hosts_sync,
+        last_success: None,
+        last_cleanup: None,
+        last_error: None,
+    }));
+
     let context = Context {
         handle: endpoint,
         storage,
@@ -431,6 +445,7 @@ fallback attempts: {:#?}",
         started_at: time_now(),
         join_announced: Arc::new(AtomicBool::new(false)),
         paused: Arc::new(AtomicBool::new(false)),
+        hosts_sync,
     };
 
     if context.args.daemon && !context.args.primary {
@@ -455,6 +470,77 @@ async fn wait_for_non_empty_addr(endpoint: &Endpoint) -> EndpointAddr {
 }
 
 impl Context {
+    fn hosts_sync_path(&self) -> Option<PathBuf> {
+        hosts_sync_path(&self.args)
+    }
+
+    pub fn hosts_sync_status(&self) -> HostsSyncStatus {
+        self.hosts_sync.read().clone()
+    }
+
+    fn set_hosts_sync_error(&self, err: impl Into<String>) {
+        let mut status = self.hosts_sync.write();
+        status.last_error = Some(err.into());
+    }
+
+    pub fn sync_hosts_file(&self) -> Result<bool> {
+        if !self.args.hosts_sync {
+            return Ok(false);
+        }
+
+        let Some(hosts_path) = self.hosts_sync_path() else {
+            anyhow::bail!("hosts sync is enabled but no hosts path is available");
+        };
+
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|entry| entry.value().clone())
+            .chain([self.me.as_ref().clone()])
+            .collect::<Vec<_>>();
+
+        match hosts::sync_nodes_to_hosts(
+            &hosts_path,
+            &self.handle.addr(),
+            nodes,
+            self.args.hosts_suffix.as_deref(),
+        ) {
+            Ok(changed) => {
+                let mut status = self.hosts_sync.write();
+                status.last_success = Some(time_now());
+                status.last_error = None;
+                Ok(changed)
+            }
+            Err(err) => {
+                self.set_hosts_sync_error(err.to_string());
+                Err(err.into())
+            }
+        }
+    }
+
+    pub fn clear_hosts_file(&self) -> Result<bool> {
+        if !self.args.hosts_sync {
+            return Ok(false);
+        }
+
+        let Some(hosts_path) = self.hosts_sync_path() else {
+            anyhow::bail!("hosts cleanup is enabled but no hosts path is available");
+        };
+
+        match hosts::clear_managed_hosts(&hosts_path) {
+            Ok(changed) => {
+                let mut status = self.hosts_sync.write();
+                status.last_cleanup = Some(time_now());
+                status.last_error = None;
+                Ok(changed)
+            }
+            Err(err) => {
+                self.set_hosts_sync_error(err.to_string());
+                Err(err.into())
+            }
+        }
+    }
+
     fn decode_and_verify(&self, bytes: Bytes) -> Result<(PublicKey, Message, bool)> {
         let signed = SignedMessage::decode(bytes)?;
         let (from, message) = signed.verify_and_decode_message()?;
@@ -643,6 +729,12 @@ impl Context {
     pub async fn graceful_shutdown(&self) {
         if self.args.daemon {
             let _ = self.broadcast_message(Message::Left).await;
+        }
+
+        if self.args.hosts_sync
+            && let Err(e) = self.clear_hosts_file()
+        {
+            log::error!("Failed to clean hosts file on shutdown: {e:#}");
         }
 
         let _ = self.save().await;
@@ -968,4 +1060,16 @@ impl Context {
     pub fn uptime_seconds(&self) -> u64 {
         time_now().saturating_sub(self.started_at)
     }
+}
+
+fn hosts_sync_path(args: &DaemonArgs) -> Option<PathBuf> {
+    if !args.hosts_sync {
+        return None;
+    }
+
+    args.hosts_path.clone().or_else(|| {
+        hosts::HostsBuilder::default_path()
+            .ok()
+            .or_else(|| Some(PathBuf::from("/etc/hosts")))
+    })
 }

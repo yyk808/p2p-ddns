@@ -12,7 +12,6 @@ use p2p_ddns::{
         args::{DaemonArgs, LogLevel},
         output, paths,
     },
-    hosts,
     net::init_network,
     storage, util,
 };
@@ -119,7 +118,7 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
     log::info!("Daemon started");
 
     if args.hosts_sync {
-        sync_hosts_file(&ctx, &args)?;
+        sync_hosts_file(&ctx)?;
     }
 
     let socket_path = p2p_ddns::admin::server::default_socket_path();
@@ -153,7 +152,7 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
                 tick.tick().await;
                 output::print(&ctx);
                 if args.hosts_sync
-                    && let Err(e) = sync_hosts_file(&ctx, &args)
+                    && let Err(e) = sync_hosts_file(&ctx)
                 {
                     log::error!("Failed to synchronize hosts file: {e:#}");
                 }
@@ -165,28 +164,14 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
     Ok(())
 }
 
-fn sync_hosts_file(ctx: &p2p_ddns::net::Context, args: &DaemonArgs) -> Result<()> {
-    let hosts_path = args.hosts_path.clone().unwrap_or_else(|| {
-        hosts::HostsBuilder::default_path().unwrap_or_else(|_| PathBuf::from("/etc/hosts"))
-    });
-
-    let nodes = ctx
-        .nodes
-        .iter()
-        .map(|entry| entry.value().clone())
-        .chain([ctx.me.as_ref().clone()])
-        .collect::<Vec<_>>();
-
-    let changed = hosts::sync_nodes_to_hosts(
-        &hosts_path,
-        &ctx.handle.addr(),
-        nodes,
-        args.hosts_suffix.as_deref(),
-    )?;
+fn sync_hosts_file(ctx: &p2p_ddns::net::Context) -> Result<()> {
+    let changed = ctx.sync_hosts_file()?;
+    let status = ctx.hosts_sync_status();
+    let hosts_path = status.path.unwrap_or_else(|| "/etc/hosts".to_string());
     if changed {
-        log::info!("Synchronized hosts records to {}", hosts_path.display());
+        log::info!("Synchronized hosts records to {hosts_path}");
     } else {
-        log::debug!("Hosts records already up to date: {}", hosts_path.display());
+        log::debug!("Hosts records already up to date: {hosts_path}");
     }
     Ok(())
 }
@@ -423,6 +408,23 @@ fn display_status(status: &p2p_ddns::domain::client::DaemonStatus) {
     println!("Uptime: {}s", status.uptime_seconds);
     println!("My Domain: {}", status.my_domain);
     println!("My Address: {}", status.my_addr);
+    println!("Hosts Sync Enabled: {}", status.hosts_sync.enabled);
+    if let Some(path) = &status.hosts_sync.path {
+        println!("Hosts Sync Path: {}", path);
+    }
+    println!(
+        "Hosts Cleanup On Shutdown: {}",
+        status.hosts_sync.cleanup_on_shutdown
+    );
+    if let Some(ts) = status.hosts_sync.last_success {
+        println!("Hosts Sync Last Success: {}", ts);
+    }
+    if let Some(ts) = status.hosts_sync.last_cleanup {
+        println!("Hosts Sync Last Cleanup: {}", ts);
+    }
+    if let Some(err) = &status.hosts_sync.last_error {
+        println!("Hosts Sync Last Error: {}", err);
+    }
 }
 
 fn format_duration(seconds: u64) -> String {

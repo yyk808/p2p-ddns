@@ -393,6 +393,10 @@ pub fn sync_nodes_to_hosts<P: AsRef<Path>>(
     builder.write_to(hosts_path)
 }
 
+pub fn clear_managed_hosts<P: AsRef<Path>>(hosts_path: P) -> io::Result<bool> {
+    HostsBuilder::new(HOSTS_TAG).write_to(hosts_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

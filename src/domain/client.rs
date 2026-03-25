@@ -22,6 +22,18 @@ pub struct DaemonStatus {
     pub uptime_seconds: u64,
     pub my_domain: String,
     pub my_addr: String,
+    pub hosts_sync: HostsSyncStatus,
+}
+
+/// Hosts同步状态
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostsSyncStatus {
+    pub enabled: bool,
+    pub path: Option<String>,
+    pub cleanup_on_shutdown: bool,
+    pub last_success: Option<u64>,
+    pub last_cleanup: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 /// Client信息（存储在daemon的client registry中）

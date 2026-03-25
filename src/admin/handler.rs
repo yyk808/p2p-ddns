@@ -234,6 +234,7 @@ pub async fn handle_command(
                 uptime_seconds: ctx.uptime_seconds(),
                 my_domain: ctx.me.domain.clone(),
                 my_addr,
+                hosts_sync: ctx.hosts_sync_status(),
             };
             CommandOutcome {
                 response: ClientResponse::Status(status),

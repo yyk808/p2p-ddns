@@ -22,6 +22,8 @@ async fn make_context() -> Result<(p2p_ddns::net::Context, Arc<ClientRegistry>)>
     args.bind = Some("127.0.0.1:0".to_string());
     args.no_mdns = true;
     args.dht = false;
+    args.hosts_sync = true;
+    args.hosts_path = Some(dir.path().join("hosts"));
     DaemonArgs::validate(&args)?;
 
     let storage = Storage::new(dir.path().join("storage.db"))?;
@@ -105,6 +107,8 @@ async fn pause_and_resume_affect_status() -> Result<()> {
         other => anyhow::bail!("unexpected response: {other:?}"),
     };
     assert!(status.paused);
+    assert!(status.hosts_sync.enabled);
+    assert!(status.hosts_sync.path.is_some());
 
     let _ = handler::handle_command(&ClientCommand::Resume, &ctx, &clients).await;
     let status = match handler::handle_command(&ClientCommand::Status, &ctx, &clients)
