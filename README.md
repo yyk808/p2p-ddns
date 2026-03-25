@@ -62,6 +62,9 @@ cargo build
 cargo run -- --daemon --primary --domain mynode
 ```
 
+The primary daemon prints `Ticket (raw): <TICKET_STRING>` on startup. Copy that value and use it
+to join other daemons or authenticate local admin client commands.
+
 ### Join an existing network
 
 ```bash
@@ -69,6 +72,8 @@ cargo run -- --daemon --ticket <TICKET_STRING> --domain mynode
 ```
 
 ### Query a running daemon from the local machine
+
+`client` mode requires a valid network ticket for authentication.
 
 ```bash
 cargo run -- --client --ticket <TICKET_STRING> status
@@ -113,14 +118,15 @@ cargo run -- --daemon --primary --domain mynode --hosts-sync --hosts-path /tmp/p
 ### Example admin flow
 
 1. Start a primary daemon.
-2. Fetch its ticket with `get-ticket`.
+2. Copy the `Ticket (raw)` value printed by the primary daemon at startup.
 3. Start other daemons with that ticket.
 4. Use `list` or `status` from `client` mode to inspect the network.
+5. Use `get-ticket` later only if you already have a valid ticket and want to re-save or re-share it.
 
 ### Example DDNS Flow
 
 1. Start a primary daemon with `--hosts-sync`.
-2. Fetch its ticket with `get-ticket`.
+2. Copy the `Ticket (raw)` value printed by the primary daemon at startup.
 3. Start other daemons with the same ticket and `--hosts-sync`.
 4. Wait for membership to converge.
 5. Resolve peer names locally through the managed `p2p-ddns` section in the hosts file.

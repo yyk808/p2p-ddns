@@ -124,9 +124,9 @@ monitor_ticket() {
         local ticket=""
 
         if [[ -f "$log_file" ]]; then
-            ticket=$(grep -Eo "New Ticket: [a-zA-Z0-9+/]+" "$log_file" 2>/dev/null | tail -1 | cut -d' ' -f3 || true)
+            ticket=$(grep -Eo "Ticket \(raw\): [a-zA-Z0-9+/]+" "$log_file" 2>/dev/null | tail -1 | cut -d' ' -f3 || true)
             if [[ -z "$ticket" ]]; then
-                ticket=$(grep -Eo "Ticket: [a-zA-Z0-9+/]+" "$log_file" 2>/dev/null | tail -1 | cut -d' ' -f2 || true)
+                ticket=$(grep -Eo "New Ticket: [a-zA-Z0-9+/]+" "$log_file" 2>/dev/null | tail -1 | cut -d' ' -f3 || true)
             fi
         fi
 

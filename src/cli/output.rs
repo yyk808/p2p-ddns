@@ -94,3 +94,10 @@ pub fn log_startup(ctx: &Context) {
     );
     log::info!("Ticket (raw): {}", ctx.ticket);
 }
+
+pub fn print_bootstrap_ticket(ctx: &Context) {
+    if ctx.args.primary {
+        println!("Ticket (raw): {}", ctx.ticket);
+        println!("Share this ticket with other nodes so they can join the network.");
+    }
+}

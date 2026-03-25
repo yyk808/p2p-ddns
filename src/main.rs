@@ -114,6 +114,7 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
     let ctx = Arc::new(ctx);
     let clients = Arc::new(ClientRegistry::new());
 
+    output::print_bootstrap_ticket(&ctx);
     output::log_startup(&ctx);
     log::info!("Daemon started");
 
