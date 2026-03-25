@@ -1,0 +1,35 @@
+[Unit]
+Description=p2p-ddns (P2P DDNS daemon)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=p2p-ddns
+Group=p2p-ddns
+
+# Optional local overrides (installed by the deb as a conffile).
+EnvironmentFile=-/etc/default/p2p-ddns
+
+ExecStart=/usr/lib/p2p-ddns/p2p-ddns-wrapper
+Restart=on-failure
+RestartSec=2s
+
+# Creates /run/p2p-ddns owned by p2p-ddns:p2p-ddns.
+RuntimeDirectory=p2p-ddns
+RuntimeDirectoryMode=0755
+
+# Creates /var/lib/p2p-ddns owned by p2p-ddns:p2p-ddns.
+StateDirectory=p2p-ddns
+StateDirectoryMode=0750
+
+UMask=007
+
+# Basic hardening (keep conservative; iroh needs normal networking/syscalls).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

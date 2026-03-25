@@ -1,0 +1,44 @@
+# /etc/default/p2p-ddns
+#
+# This file is sourced by systemd (p2p-ddns.service) and controls how the daemon starts.
+#
+# After editing:
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart p2p-ddns
+#
+# To let a normal user run the client against the management socket:
+#   sudo usermod -aG p2p-ddns $USER
+#   newgrp p2p-ddns
+#
+
+# Role:
+# - "primary": create a new network if none exists, otherwise reuse the existing one.
+# - "daemon": join an existing network using P2P_DDNS_TICKET.
+P2P_DDNS_ROLE=primary
+
+# Required when P2P_DDNS_ROLE=daemon:
+# P2P_DDNS_TICKET=...
+
+# Optional per-node settings:
+# P2P_DDNS_DOMAIN=node-1
+# P2P_DDNS_BIND_ADDRESS=0.0.0.0:7777
+# P2P_DDNS_LOG_LEVEL=info
+# P2P_DDNS_NO_MDNS=0
+# P2P_DDNS_DHT=0
+# P2P_DDNS_ADMIN_HTTP=127.0.0.1:8080
+#
+# Connectivity across NAT / WAN:
+# - Default is fully offline (`disabled`) which requires routable addresses in the ticket or LAN discovery.
+# - Use a self-hosted relay by setting one or more URLs:
+#     P2P_DDNS_RELAY_URLS=https://relay.example.com,https://relay2.example.com
+# - Or (not recommended if you want no external deps) use n0 relays:
+#     P2P_DDNS_RELAY_MODE=default
+
+# Relay mode: disabled|default|staging (ignored if P2P_DDNS_RELAY_URLS is set)
+P2P_DDNS_RELAY_MODE=disabled
+
+# Comma-separated list of relay URLs (self-hosted)
+# P2P_DDNS_RELAY_URLS=
+
+# Extra args appended verbatim (simple whitespace splitting):
+# P2P_DDNS_EXTRA_ARGS=

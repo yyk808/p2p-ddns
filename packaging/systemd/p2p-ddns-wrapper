@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# systemd service wrapper for p2p-ddns.
+#
+# Reads configuration from environment variables (typically via /etc/default/p2p-ddns),
+# constructs CLI args, and execs the daemon.
+
+bool() {
+  local v="${1:-}"
+  case "${v,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ROLE="${P2P_DDNS_ROLE:-primary}"
+TICKET="${P2P_DDNS_TICKET:-}"
+DOMAIN="${P2P_DDNS_DOMAIN:-}"
+LOG_LEVEL="${P2P_DDNS_LOG_LEVEL:-info}"
+BIND_ADDRESS="${P2P_DDNS_BIND_ADDRESS:-}"
+ADMIN_HTTP="${P2P_DDNS_ADMIN_HTTP:-}"
+EXTRA_ARGS="${P2P_DDNS_EXTRA_ARGS:-}"
+
+RELAY_MODE="${P2P_DDNS_RELAY_MODE:-disabled}"
+RELAY_URLS="${P2P_DDNS_RELAY_URLS:-}"
+
+NO_MDNS="${P2P_DDNS_NO_MDNS:-0}"
+DHT="${P2P_DDNS_DHT:-0}"
+
+# systemd creates these dirs via RuntimeDirectory/StateDirectory, but allow override.
+CONFIG_DIR="${P2P_DDNS_CONFIG_DIR:-/var/lib/p2p-ddns}"
+RUNTIME_DIR="${P2P_DDNS_RUNTIME_DIR:-/run/p2p-ddns}"
+
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+
+mkdir -p "${CONFIG_DIR}" "${RUNTIME_DIR}"
+
+if [[ -z "${DOMAIN}" ]]; then
+  DOMAIN="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo p2p-ddns)"
+fi
+
+ARGS=(--daemon --config "${CONFIG_DIR}" --domain "${DOMAIN}" --log "${LOG_LEVEL}")
+
+if [[ -n "${BIND_ADDRESS}" ]]; then
+  ARGS+=(--bind "${BIND_ADDRESS}")
+fi
+
+if [[ -n "${ADMIN_HTTP}" ]]; then
+  ARGS+=(--admin-http "${ADMIN_HTTP}")
+fi
+
+if bool "${NO_MDNS}"; then
+  ARGS+=(--no-mdns)
+fi
+
+if bool "${DHT}"; then
+  ARGS+=(--dht)
+fi
+
+if [[ -n "${RELAY_URLS}" ]]; then
+  IFS=',' read -r -a RELAYS <<<"${RELAY_URLS}"
+  for url in "${RELAYS[@]}"; do
+    url="${url#"${url%%[![:space:]]*}"}"
+    url="${url%"${url##*[![:space:]]}"}"
+    if [[ -n "${url}" ]]; then
+      ARGS+=(--relay-url "${url}")
+    fi
+  done
+else
+  ARGS+=(--relay-mode "${RELAY_MODE}")
+fi
+
+case "${ROLE}" in
+  primary)
+    if [[ -n "${TICKET}" ]]; then
+      echo "p2p-ddns: P2P_DDNS_TICKET is set but P2P_DDNS_ROLE=primary; ignoring ticket." >&2
+    fi
+    ARGS+=(--primary)
+    ;;
+  daemon)
+    if [[ -z "${TICKET}" ]]; then
+      echo "p2p-ddns: P2P_DDNS_ROLE=daemon requires P2P_DDNS_TICKET to be set." >&2
+      exit 2
+    fi
+    ARGS+=(--ticket "${TICKET}")
+    ;;
+  *)
+    echo "p2p-ddns: invalid P2P_DDNS_ROLE=${ROLE} (expected: primary|daemon)" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -n "${EXTRA_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA=( ${EXTRA_ARGS} )
+  ARGS+=("${EXTRA[@]}")
+fi
+
+exec /usr/bin/p2p-ddns "${ARGS[@]}"
