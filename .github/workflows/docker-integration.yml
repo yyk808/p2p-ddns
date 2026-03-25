@@ -1,0 +1,110 @@
+name: Docker Integration
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_full_suite:
+        description: Run the heavier docker matrix and negative-topology suites
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  smoke:
+    name: Docker Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      P2P_DDNS_IT_IMAGE_TAG: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Docker environment
+        run: |
+          docker version
+          docker info
+          docker system df
+
+      - name: Pre-clean Docker leftovers
+        run: scripts/cleanup_docker_p2p_it.sh --containers --networks --images --prune
+
+      - name: Run smoke topology
+        run: cargo test --test docker_p2p docker_p2p_smoke -- --nocapture
+
+      - name: Docker disk usage on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker network ls
+          docker system df
+
+      - name: Cleanup Docker resources
+        if: always()
+        run: scripts/cleanup_docker_p2p_it.sh --containers --networks --images --prune
+
+  full-suite:
+    name: Docker Matrix And Negative
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    if: github.event_name == 'workflow_dispatch' && inputs.run_full_suite
+    env:
+      P2P_DDNS_IT_IMAGE_TAG: gha-full-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Docker environment
+        run: |
+          docker version
+          docker info
+          docker system df
+
+      - name: Pre-clean Docker leftovers
+        run: scripts/cleanup_docker_p2p_it.sh --containers --networks --images --prune
+
+      - name: Run topology matrix
+        run: cargo test --test docker_p2p docker_p2p_matrix -- --nocapture
+
+      - name: Run negative-topology cases
+        run: cargo test --test docker_p2p docker_p2p_expected_failures -- --nocapture
+
+      - name: Docker disk usage on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker network ls
+          docker system df
+
+      - name: Cleanup Docker resources
+        if: always()
+        run: scripts/cleanup_docker_p2p_it.sh --containers --networks --images --prune
