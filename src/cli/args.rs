@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{fmt::Display, str::FromStr};
+use std::{fmt::Display, path::PathBuf, str::FromStr};
 
 use anyhow::Result;
 use clap::{Parser, builder::TypedValueParser};
@@ -74,6 +74,21 @@ pub struct DaemonArgs {
     /// Enable admin HTTP server (e.g. 127.0.0.1:8080)
     #[arg(long, value_name = "ADMIN_HTTP")]
     pub admin_http: Option<String>,
+
+    /// Synchronize resolved node names into a hosts file section.
+    ///
+    /// This is the application's DDNS integration path. When enabled without `--hosts-path`, the
+    /// daemon updates the system hosts file (for example `/etc/hosts` on Unix).
+    #[arg(long, default_value_t = false)]
+    pub hosts_sync: bool,
+
+    /// Hosts file path to update when `--hosts-sync` is enabled.
+    #[arg(long, value_name = "HOSTS_PATH", value_hint = clap::ValueHint::FilePath)]
+    pub hosts_path: Option<PathBuf>,
+
+    /// Optional DNS suffix to add alongside bare node names, e.g. `p2p`.
+    #[arg(long, value_name = "HOSTS_SUFFIX")]
+    pub hosts_suffix: Option<String>,
 
     /// Relay mode (for NAT traversal / rendezvous).
     ///
@@ -192,6 +207,12 @@ impl DaemonArgs {
 
         if let Some(bind) = args.admin_http.as_deref() {
             let _ = util::parse_bind_addr(bind)?;
+        }
+
+        if let Some(path) = args.hosts_path.as_ref()
+            && path.is_dir()
+        {
+            anyhow::bail!("--hosts-path must be a file path, not a directory");
         }
 
         for url in &args.relay_url {

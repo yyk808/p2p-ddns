@@ -25,7 +25,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::OpenOptions,
     io::{self, BufRead, BufReader, ErrorKind, Write},
@@ -35,7 +35,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use iroh::EndpointAddr;
+
+use crate::{
+    domain::{client::SERVICE_MARKER_CLIENT, node::Node},
+    util,
+};
+
 pub type Result<T> = result::Result<T, Box<dyn std::error::Error>>;
+pub const HOSTS_TAG: &str = "p2p-ddns";
 
 /// A custom error struct for this crate.
 #[allow(dead_code)]
@@ -325,10 +333,74 @@ impl HostsBuilder {
     }
 }
 
+fn is_valid_hostname_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 {
+        return false;
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+fn canonical_hostname(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed.len() > 253 {
+        return None;
+    }
+    if !trimmed.split('.').all(is_valid_hostname_label) {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn record_ip_for_local(remote: &EndpointAddr, local: &EndpointAddr) -> Option<IpAddr> {
+    let best = util::best_endpoint_addr_for_local(remote, local);
+    best.ip_addrs().next().map(|sock| sock.ip())
+}
+
+pub fn sync_nodes_to_hosts<P: AsRef<Path>>(
+    hosts_path: P,
+    local: &EndpointAddr,
+    nodes: impl IntoIterator<Item = Node>,
+    suffix: Option<&str>,
+) -> io::Result<bool> {
+    let mut builder = HostsBuilder::new(HOSTS_TAG);
+    let suffix = suffix.and_then(canonical_hostname);
+
+    for node in nodes {
+        if node.services.contains_key(SERVICE_MARKER_CLIENT) {
+            continue;
+        }
+
+        let Some(ip) = record_ip_for_local(&node.addr, local) else {
+            continue;
+        };
+        let Some(hostname) = canonical_hostname(&node.domain) else {
+            log::warn!("Skipping invalid hostname for hosts sync: {}", node.domain);
+            continue;
+        };
+
+        let mut hostnames = BTreeSet::from([hostname.clone()]);
+        if let Some(suffix) = suffix.as_ref() {
+            hostnames.insert(format!("{hostname}.{suffix}"));
+        }
+        builder.add_hostnames(ip, hostnames);
+    }
+
+    builder.write_to(hosts_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    use iroh::{EndpointAddr, SecretKey, TransportAddr};
+
+    use crate::domain::node::Node;
 
     #[test]
     fn test_temp_path_good() {
@@ -365,5 +437,52 @@ mod tests {
         assert!(contents.starts_with("preexisting\ncontent"));
         assert!(contents.contains("# DO NOT EDIT foo BEGIN"));
         assert!(contents.contains("1.1.1.1 whatever"));
+    }
+
+    fn node_with_ipv4(name: &str, addr: &str) -> Node {
+        let mut rng = rand::rng();
+        let pk = SecretKey::generate(&mut rng).public();
+        let sock = addr.parse().unwrap();
+        Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::from_parts(pk, [TransportAddr::Ip(sock)]),
+            domain: name.to_string(),
+            services: Default::default(),
+            last_heartbeat: 1,
+        }
+    }
+
+    #[test]
+    fn sync_nodes_to_hosts_writes_names_and_suffix() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let local_pk = SecretKey::generate(&mut rand::rng()).public();
+        let local = EndpointAddr::from_parts(
+            local_pk,
+            [TransportAddr::Ip("192.168.1.10:7777".parse().unwrap())],
+        );
+
+        let mut client_node = node_with_ipv4("client", "192.168.1.30:7777");
+        client_node
+            .services
+            .insert(SERVICE_MARKER_CLIENT.to_string(), 1);
+
+        sync_nodes_to_hosts(
+            temp.path(),
+            &local,
+            vec![
+                node_with_ipv4("alpha", "192.168.1.20:7777"),
+                node_with_ipv4("bad name", "192.168.1.21:7777"),
+                client_node,
+            ],
+            Some("p2p"),
+        )
+        .unwrap();
+
+        let contents = std::fs::read_to_string(temp.path()).unwrap();
+        assert!(contents.contains("# DO NOT EDIT p2p-ddns BEGIN"));
+        assert!(contents.contains("192.168.1.20 alpha alpha.p2p"));
+        assert!(!contents.contains("bad name"));
+        assert!(!contents.contains("client"));
     }
 }

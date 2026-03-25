@@ -21,6 +21,9 @@ LOG_LEVEL="${P2P_DDNS_LOG_LEVEL:-info}"
 BIND_ADDRESS="${P2P_DDNS_BIND_ADDRESS:-}"
 ADMIN_HTTP="${P2P_DDNS_ADMIN_HTTP:-}"
 EXTRA_ARGS="${P2P_DDNS_EXTRA_ARGS:-}"
+HOSTS_SYNC="${P2P_DDNS_HOSTS_SYNC:-0}"
+HOSTS_PATH="${P2P_DDNS_HOSTS_PATH:-}"
+HOSTS_SUFFIX="${P2P_DDNS_HOSTS_SUFFIX:-}"
 
 RELAY_MODE="${P2P_DDNS_RELAY_MODE:-disabled}"
 RELAY_URLS="${P2P_DDNS_RELAY_URLS:-}"
@@ -48,6 +51,18 @@ fi
 
 if [[ -n "${ADMIN_HTTP}" ]]; then
   ARGS+=(--admin-http "${ADMIN_HTTP}")
+fi
+
+if bool "${HOSTS_SYNC}"; then
+  ARGS+=(--hosts-sync)
+fi
+
+if [[ -n "${HOSTS_PATH}" ]]; then
+  ARGS+=(--hosts-path "${HOSTS_PATH}")
+fi
+
+if [[ -n "${HOSTS_SUFFIX}" ]]; then
+  ARGS+=(--hosts-suffix "${HOSTS_SUFFIX}")
 fi
 
 if bool "${NO_MDNS}"; then

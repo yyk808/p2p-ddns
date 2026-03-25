@@ -12,6 +12,7 @@ use p2p_ddns::{
         args::{DaemonArgs, LogLevel},
         output, paths,
     },
+    hosts,
     net::init_network,
     storage, util,
 };
@@ -117,6 +118,10 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
     output::log_startup(&ctx);
     log::info!("Daemon started");
 
+    if args.hosts_sync {
+        sync_hosts_file(&ctx, &args)?;
+    }
+
     let socket_path = p2p_ddns::admin::server::default_socket_path();
     tokio::spawn({
         let ctx = ctx.clone();
@@ -141,16 +146,48 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     tokio::spawn({
         let ctx = ctx.clone();
+        let args = args.clone();
         async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
                 output::print(&ctx);
+                if args.hosts_sync
+                    && let Err(e) = sync_hosts_file(&ctx, &args)
+                {
+                    log::error!("Failed to synchronize hosts file: {e:#}");
+                }
             }
         }
     });
 
     ctx.run(gos_recv, sp_recv).await;
+    Ok(())
+}
+
+fn sync_hosts_file(ctx: &p2p_ddns::net::Context, args: &DaemonArgs) -> Result<()> {
+    let hosts_path = args.hosts_path.clone().unwrap_or_else(|| {
+        hosts::HostsBuilder::default_path().unwrap_or_else(|_| PathBuf::from("/etc/hosts"))
+    });
+
+    let nodes = ctx
+        .nodes
+        .iter()
+        .map(|entry| entry.value().clone())
+        .chain([ctx.me.as_ref().clone()])
+        .collect::<Vec<_>>();
+
+    let changed = hosts::sync_nodes_to_hosts(
+        &hosts_path,
+        &ctx.handle.addr(),
+        nodes,
+        args.hosts_suffix.as_deref(),
+    )?;
+    if changed {
+        log::info!("Synchronized hosts records to {}", hosts_path.display());
+    } else {
+        log::debug!("Hosts records already up to date: {}", hosts_path.display());
+    }
     Ok(())
 }
 

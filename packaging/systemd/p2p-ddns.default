@@ -26,6 +26,8 @@ P2P_DDNS_ROLE=primary
 # P2P_DDNS_NO_MDNS=0
 # P2P_DDNS_DHT=0
 # P2P_DDNS_ADMIN_HTTP=127.0.0.1:8080
+# P2P_DDNS_HOSTS_SYNC=1
+# P2P_DDNS_HOSTS_SUFFIX=p2p
 #
 # Connectivity across NAT / WAN:
 # - Default is fully offline (`disabled`) which requires routable addresses in the ticket or LAN discovery.
@@ -39,6 +41,9 @@ P2P_DDNS_RELAY_MODE=disabled
 
 # Comma-separated list of relay URLs (self-hosted)
 # P2P_DDNS_RELAY_URLS=
+
+# Optional custom hosts file path. Defaults to the system hosts file.
+# P2P_DDNS_HOSTS_PATH=
 
 # Extra args appended verbatim (simple whitespace splitting):
 # P2P_DDNS_EXTRA_ARGS=
