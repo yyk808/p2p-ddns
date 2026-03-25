@@ -63,6 +63,15 @@ fn docker_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+fn skip_if_docker_unavailable(test_name: &str) -> Result<bool> {
+    if docker_available() {
+        return Ok(false);
+    }
+
+    eprintln!("Skipping {test_name}: docker is not available");
+    Ok(true)
+}
+
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -782,7 +791,9 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
 
 #[tokio::test]
 async fn docker_p2p_smoke() -> Result<()> {
-    anyhow::ensure!(docker_available(), "docker is not available");
+    if skip_if_docker_unavailable("docker_p2p_smoke")? {
+        return Ok(());
+    }
 
     let tag = ensure_images_built().await?;
 
@@ -811,7 +822,9 @@ async fn docker_p2p_smoke() -> Result<()> {
 
 #[tokio::test]
 async fn docker_p2p_matrix() -> Result<()> {
-    anyhow::ensure!(docker_available(), "docker is not available");
+    if skip_if_docker_unavailable("docker_p2p_matrix")? {
+        return Ok(());
+    }
 
     let tag = ensure_images_built().await?;
 
@@ -973,7 +986,9 @@ async fn docker_p2p_matrix() -> Result<()> {
 
 #[tokio::test]
 async fn docker_p2p_expected_failures() -> Result<()> {
-    anyhow::ensure!(docker_available(), "docker is not available");
+    if skip_if_docker_unavailable("docker_p2p_expected_failures")? {
+        return Ok(());
+    }
 
     let tag = ensure_images_built().await?;
 
