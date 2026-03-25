@@ -13,6 +13,9 @@ ENV P2P_DDNS_MODE=daemon
 ENV P2P_DDNS_PRIMARY=false
 ENV P2P_DDNS_LOG_LEVEL=info
 
+# Integration tests exercise hosts-based DDNS, which updates /etc/hosts.
+USER root
+
 # Set default entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
 

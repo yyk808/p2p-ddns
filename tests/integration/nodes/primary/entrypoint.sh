@@ -22,6 +22,14 @@ error() {
     echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] PRIMARY ERROR:${NC} $1" >&2
 }
 
+bool() {
+    local v="${1:-}"
+    case "${v,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Wait for network to be ready
 wait_for_network() {
     log "Waiting for network to be ready..."
@@ -90,6 +98,16 @@ setup_config() {
     if [[ -n "${P2P_DDNS_BIND_ADDRESS:-}" ]]; then
         log "Setting bind address to: $P2P_DDNS_BIND_ADDRESS"
         ARGS+=("--bind" "$P2P_DDNS_BIND_ADDRESS")
+    fi
+
+    if bool "${P2P_DDNS_HOSTS_SYNC:-1}"; then
+        log "Enabling hosts synchronization"
+        ARGS+=("--hosts-sync")
+    fi
+
+    if [[ -n "${P2P_DDNS_HOSTS_SUFFIX:-}" ]]; then
+        log "Setting hosts suffix to: $P2P_DDNS_HOSTS_SUFFIX"
+        ARGS+=("--hosts-suffix" "$P2P_DDNS_HOSTS_SUFFIX")
     fi
 }
 

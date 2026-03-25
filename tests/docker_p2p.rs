@@ -360,6 +360,22 @@ async fn exec_stdout(
     Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
+async fn hosts_lookup(
+    container: &testcontainers::ContainerAsync<GenericImage>,
+    name: &str,
+) -> Result<String> {
+    exec_stdout(
+        container,
+        vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            format!("getent hosts {name} 2>/dev/null || true"),
+        ],
+    )
+    .await
+    .map(|out| out.trim().to_string())
+}
+
 fn extract_ticket(text: &str) -> Option<String> {
     fn extract_after_prefix(line: &str, prefix: &str) -> Option<String> {
         let idx = line.find(prefix)?;
@@ -481,6 +497,75 @@ async fn wait_for_primary_converged(
                 missing,
                 last_out
             );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_hosts_resolution(
+    container: &testcontainers::ContainerAsync<GenericImage>,
+    names: &[String],
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last = Vec::new();
+    loop {
+        let mut missing = Vec::new();
+        last.clear();
+        for name in names {
+            let out = hosts_lookup(container, name).await?;
+            last.push((name.clone(), out.clone()));
+            if out.is_empty() {
+                missing.push(name.clone());
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            let snapshot = last
+                .iter()
+                .map(|(name, out)| {
+                    format!("{name}: {}", if out.is_empty() { "<missing>" } else { out })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "hosts resolution did not converge after {}s, missing={missing:?}\n{}",
+                timeout.as_secs(),
+                snapshot
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn assert_hosts_missing_for(
+    container: &testcontainers::ContainerAsync<GenericImage>,
+    forbidden_names: &[String],
+    duration: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + duration;
+    loop {
+        let mut resolved = Vec::new();
+        for name in forbidden_names {
+            let out = hosts_lookup(container, name).await?;
+            if !out.is_empty() {
+                resolved.push(format!("{name}: {out}"));
+            }
+        }
+
+        if !resolved.is_empty() {
+            anyhow::bail!(
+                "forbidden hosts unexpectedly resolved:\n{}",
+                resolved.join("\n")
+            );
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(());
         }
         sleep(Duration::from_millis(500)).await;
     }
@@ -675,10 +760,36 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
         }
 
         let all_daemons = daemon_names(case.daemon_count);
+        let expected_resolvable = std::iter::once("primary-node".to_string())
+            .chain(all_daemons.iter().cloned())
+            .collect::<Vec<_>>();
         match &case.expectation {
             Expectation::ConvergeAllDaemons => {
                 wait_for_primary_converged(&primary, &ticket, &all_daemons, case.converge_timeout)
                     .await?;
+                wait_for_hosts_resolution(&primary, &expected_resolvable, case.converge_timeout)
+                    .await?;
+                for network_index in 0..case.subnet_count {
+                    let Some(name) = daemon_names_in_network(
+                        case.daemon_count,
+                        case.subnet_count,
+                        network_index,
+                    )
+                    .into_iter()
+                    .next() else {
+                        continue;
+                    };
+                    let daemon_index = name
+                        .strip_prefix("daemon-")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .and_then(|n| n.checked_sub(1))
+                        .context("parse representative daemon index")?;
+                    let daemon = daemons
+                        .get(daemon_index)
+                        .context("missing representative daemon container")?;
+                    wait_for_hosts_resolution(daemon, &expected_resolvable, case.converge_timeout)
+                        .await?;
+                }
             }
             Expectation::ConvergeSubset {
                 must_include,
@@ -687,6 +798,11 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
             } => {
                 wait_for_primary_converged(&primary, &ticket, must_include, case.converge_timeout)
                     .await?;
+                let primary_names = std::iter::once("primary-node".to_string())
+                    .chain(must_include.iter().cloned())
+                    .collect::<Vec<_>>();
+                wait_for_hosts_resolution(&primary, &primary_names, case.converge_timeout).await?;
+                assert_hosts_missing_for(&primary, must_exclude, *observe).await?;
                 assert_primary_missing_for(&primary, &ticket, must_exclude, *observe).await?;
             }
         }
@@ -708,6 +824,12 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
                         case.converge_timeout,
                     )
                     .await?;
+                    wait_for_hosts_resolution(
+                        &primary,
+                        &expected_resolvable,
+                        case.converge_timeout,
+                    )
+                    .await?;
                 }
                 Expectation::ConvergeSubset {
                     must_include,
@@ -721,6 +843,12 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
                         case.converge_timeout,
                     )
                     .await?;
+                    let primary_names = std::iter::once("primary-node".to_string())
+                        .chain(must_include.iter().cloned())
+                        .collect::<Vec<_>>();
+                    wait_for_hosts_resolution(&primary, &primary_names, case.converge_timeout)
+                        .await?;
+                    assert_hosts_missing_for(&primary, must_exclude, *observe).await?;
                     assert_primary_missing_for(&primary, &ticket, must_exclude, *observe).await?;
                 }
             }

@@ -143,25 +143,30 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
         });
     }
 
-    tokio::spawn({
-        let ctx = ctx.clone();
-        let args = args.clone();
-        async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tick.tick().await;
-                output::print(&ctx);
-                if args.hosts_sync
-                    && let Err(e) = sync_hosts_file(&ctx)
-                {
-                    log::error!("Failed to synchronize hosts file: {e:#}");
+    spawn_daemon_background_tasks(ctx.clone(), args.hosts_sync);
+
+    ctx.run(gos_recv, sp_recv).await;
+    Ok(())
+}
+
+fn spawn_daemon_background_tasks(ctx: Arc<p2p_ddns::net::Context>, hosts_sync: bool) {
+    tokio::spawn(async move {
+        let mut print_tick = tokio::time::interval(Duration::from_secs(30));
+        let mut hosts_tick = tokio::time::interval(Duration::from_secs(2));
+
+        loop {
+            tokio::select! {
+                _ = print_tick.tick() => {
+                    output::print(&ctx);
+                }
+                _ = hosts_tick.tick(), if hosts_sync => {
+                    if let Err(e) = sync_hosts_file(&ctx) {
+                        log::error!("Failed to synchronize hosts file: {e:#}");
+                    }
                 }
             }
         }
     });
-
-    ctx.run(gos_recv, sp_recv).await;
-    Ok(())
 }
 
 fn sync_hosts_file(ctx: &p2p_ddns::net::Context) -> Result<()> {
