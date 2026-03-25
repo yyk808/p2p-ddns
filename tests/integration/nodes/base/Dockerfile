@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # Base Dockerfile for p2p-ddns test nodes
 
 FROM rust:1.90-bookworm AS builder
