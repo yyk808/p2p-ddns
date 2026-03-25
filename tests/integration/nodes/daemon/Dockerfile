@@ -20,4 +20,4 @@ USER root
 ENTRYPOINT ["/app/entrypoint.sh"]
 
 # Default command arguments (will be overridden by compose)
-CMD ["--daemon"]
+CMD []

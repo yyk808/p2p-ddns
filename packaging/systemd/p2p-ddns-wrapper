@@ -43,7 +43,7 @@ if [[ -z "${DOMAIN}" ]]; then
   DOMAIN="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo p2p-ddns)"
 fi
 
-ARGS=(--daemon --config "${CONFIG_DIR}" --domain "${DOMAIN}" --log "${LOG_LEVEL}")
+ARGS=(--config "${CONFIG_DIR}" --domain "${DOMAIN}" --log "${LOG_LEVEL}")
 
 if [[ -n "${BIND_ADDRESS}" ]]; then
   ARGS+=(--bind "${BIND_ADDRESS}")

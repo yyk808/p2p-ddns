@@ -102,8 +102,6 @@ setup_config() {
     local node_name="${NODE_NAME:-client-node}"
     log "Setting up client node configuration for: $node_name"
 
-    # Ensure data directory exists
-    mkdir -p /app/data
     mkdir -p /app/logs
 
     ARGS=("$@")
@@ -111,35 +109,27 @@ setup_config() {
     # Set log level from environment
     if [[ -n "${P2P_DDNS_LOG_LEVEL:-}" ]]; then
         log "Setting log level to: $P2P_DDNS_LOG_LEVEL"
-        ARGS+=("--log" "$P2P_DDNS_LOG_LEVEL")
+        ARGS=("--log" "$P2P_DDNS_LOG_LEVEL" "${ARGS[@]}")
     fi
 
-    # Set custom domain if provided
-    if [[ -n "${P2P_DDNS_DOMAIN:-}" ]]; then
-        log "Setting domain to: $P2P_DDNS_DOMAIN"
-        ARGS+=("--domain" "$P2P_DDNS_DOMAIN")
+    if [[ -n "${P2P_DDNS_SOCKET_PATH:-}" ]]; then
+        log "Using socket path: $P2P_DDNS_SOCKET_PATH"
+        ARGS=("--socket-path" "$P2P_DDNS_SOCKET_PATH" "${ARGS[@]}")
     fi
 
-    # Set custom bind address if provided
-    if [[ -n "${P2P_DDNS_BIND_ADDRESS:-}" ]]; then
-        log "Setting bind address to: $P2P_DDNS_BIND_ADDRESS"
-        ARGS+=("--bind" "$P2P_DDNS_BIND_ADDRESS")
-    fi
-
-    # Storage directory (this project's CLI expects a directory)
-    ARGS+=("--config" "/app/data")
-
-    # Add ticket if available
     if [[ -n "${P2P_DDNS_TICKET:-}" ]]; then
         log "Using provided ticket"
-        ARGS+=("--ticket" "$P2P_DDNS_TICKET")
+        ARGS=("--ticket" "$P2P_DDNS_TICKET" "${ARGS[@]}")
     else
-        # Try to get ticket from file
         local ticket
-        ticket=$(wait_for_ticket)
+        ticket=$(wait_for_ticket || true)
         if [[ -n "$ticket" ]]; then
-            ARGS+=("--ticket" "$ticket")
+            ARGS=("--ticket" "$ticket" "${ARGS[@]}")
         fi
+    fi
+
+    if [[ ${#ARGS[@]} -eq 0 ]]; then
+        ARGS=("status")
     fi
 }
 
@@ -200,19 +190,9 @@ main() {
     setup_config "$@"
     setup_signal_handlers
 
-    log "Starting p2p-ddns with arguments: ${ARGS[*]}"
-
-    # Start p2p-ddns in background
-    /usr/local/bin/p2p-ddns "${ARGS[@]}" > "/app/logs/${node_name}.log" 2>&1 &
-    PID=$!
-
-    # Start DNS monitoring
-    monitor_dns &
-
-    # Wait for the process
-    wait $PID
-
-    log "Client node $node_name stopped"
+    log "Starting p2p-ddnsctl with arguments: ${ARGS[*]}"
+    /usr/local/bin/p2p-ddnsctl "${ARGS[@]}" > "/app/logs/${node_name}.log" 2>&1
+    log "Client node $node_name finished"
 }
 
 # Run main function with all arguments

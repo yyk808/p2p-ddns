@@ -30,7 +30,6 @@ pub enum RelayModeArg {
 #[command(version, about, long_about = None)]
 pub struct DaemonArgs {
     /// Internal flag used by the daemon entrypoint.
-    /// In the unified binary, `--daemon` sets this automatically.
     #[arg(skip)]
     pub daemon: bool,
 
