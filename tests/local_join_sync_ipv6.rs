@@ -66,6 +66,7 @@ async fn local_join_sync_over_ipv6_loopback() -> Result<()> {
                 addr: ctx_b.handle.addr(),
                 alias: ctx_b.me.domain.clone(),
                 services: BTreeMap::new(),
+                invitor: ctx_b.me.invitor,
             },
         )
         .await?;
@@ -76,6 +77,9 @@ async fn local_join_sync_over_ipv6_loopback() -> Result<()> {
         }
     })
     .await?;
+
+    let joined = ctx_a.nodes.get(&id_b).expect("joined node");
+    assert_eq!(joined.invitor, id_a);
 
     let mut rng = rand::rng();
     let pk_d = SecretKey::generate(&mut rng).public();

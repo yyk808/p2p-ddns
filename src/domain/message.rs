@@ -16,6 +16,7 @@ pub enum Message {
         addr: EndpointAddr,
         alias: String,
         services: BTreeMap<String, u32>,
+        invitor: EndpointId,
     },
     AboutMe {
         addr: EndpointAddr,

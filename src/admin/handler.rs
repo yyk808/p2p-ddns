@@ -8,7 +8,6 @@ use crate::{
     admin::{authz::ClientRegistry, protocol::*},
     domain::{
         client::{ClientInfo, ClientPermissions, SERVICE_MARKER_CLIENT, SERVICE_VALUE_CLIENT},
-        message::Message,
         node::Node,
         ticket::Ticket,
     },
@@ -21,6 +20,12 @@ pub enum AdminAction {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    RequireTicket,
+    AllowLocalTicketless,
+}
+
 #[derive(Debug)]
 pub struct CommandOutcome {
     pub response: ClientResponse,
@@ -31,13 +36,15 @@ pub fn authenticate_and_register(
     ctx: &Context,
     clients: &ClientRegistry,
     auth_req: &AuthRequest,
+    mode: AuthMode,
 ) -> Result<(AuthResponse, Option<EndpointId>)> {
     let ticket_valid = match auth_req.ticket.parse::<Ticket>() {
         Ok(ticket) => ticket.validate(ctx.ticket.topic(), ctx.ticket.rnum()),
         Err(_) => false,
     };
+    let auth_allowed = ticket_valid || mode == AuthMode::AllowLocalTicketless;
 
-    if !ticket_valid {
+    if !auth_allowed {
         return Ok((
             AuthResponse {
                 success: false,
@@ -104,12 +111,6 @@ pub fn authenticate_and_register(
             },
         };
         clients.add_client(pk, client_info);
-
-        let introduce_msg = Message::Introduce { invited: pk };
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let _ = ctx.broadcast_message(introduce_msg).await;
-        });
     }
 
     Ok((

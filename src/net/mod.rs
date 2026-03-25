@@ -31,7 +31,7 @@ use tokio::time::{interval, timeout};
 use crate::{
     cli::args::{DaemonArgs, RelayModeArg},
     domain::{
-        client::HostsSyncStatus,
+        client::{HostsSyncStatus, SERVICE_MARKER_CLIENT},
         merge,
         message::{Message, SignedMessage},
         node::Node,
@@ -43,16 +43,8 @@ use crate::{
     util::{best_endpoint_addr_for_local, time_now},
 };
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct Auth {
-    pub(crate) introducer: EndpointId,
-    pub(crate) introduced: bool,
-    pub(crate) node: Option<Box<Node>>,
-    pub(crate) timestamp: u64,
-}
+const STALE_NODE_TTL_SECS: u64 = 90;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Context {
     pub handle: Endpoint,
@@ -66,7 +58,6 @@ pub struct Context {
     pub me: Arc<Node>,
     pub sender: GossipSender,
     pub args: DaemonArgs,
-    pub(crate) pending_auth: DashMap<EndpointId, Auth>,
     started_at: u64,
     join_announced: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -441,7 +432,6 @@ fallback attempts: {:#?}",
         me: Arc::new(me),
         sender,
         args,
-        pending_auth: DashMap::new(),
         started_at: time_now(),
         join_announced: Arc::new(AtomicBool::new(false)),
         paused: Arc::new(AtomicBool::new(false)),
@@ -570,6 +560,7 @@ impl Context {
             addr: self.handle.addr(),
             alias: self.me.domain.clone(),
             services: self.me.services.clone(),
+            invitor: self.me.invitor,
         };
 
         if let Err(e) = self.broadcast_message(invited).await {
@@ -578,16 +569,6 @@ impl Context {
         }
 
         self.join_announced.store(true, Ordering::Relaxed);
-
-        let about_me = Message::AboutMe {
-            addr: self.handle.addr(),
-            alias: self.me.domain.clone(),
-            services: self.me.services.clone(),
-            invitor: self.me.invitor,
-        };
-        if let Err(e) = self.broadcast_message(about_me).await {
-            log::warn!("Failed to announce join (AboutMe): {e}");
-        }
     }
 
     pub async fn run(&self, mut gos_recv: GossipReceiver, mut sp_recv: Receiver<Bytes>) {
@@ -662,17 +643,30 @@ impl Context {
                     }
                 },
                 bmsg = sp_recv.next().fuse() => {
-                    if let Some(bmsg) = bmsg {
-                        if let Ok((from, msg, passed)) = self.decode_and_verify(bmsg) {
-                            log::debug!("Received p2p msg: {:?}", msg);
-                            self.process_message(from, msg, passed).await;
-                        } else {
-                            log::error!("Failed to decode and verify message from p2p");
+                    match bmsg {
+                        Some(bmsg) => {
+                            if let Ok((from, msg, passed)) = self.decode_and_verify(bmsg) {
+                                log::debug!("Received p2p msg: {:?}", msg);
+                                self.process_message(from, msg, passed).await;
+                            } else {
+                                log::error!("Failed to decode and verify message from p2p");
+                            }
+                        }
+                        None => {
+                            log::info!("P2P receiver closed; stopping daemon event loop");
+                            break;
                         }
                     }
                 },
                 evt = gos_recv.try_next().fuse() => {
-                    self.process_gossip(evt.map_err(|e| anyhow::anyhow!(e))).await;
+                    match evt {
+                        Ok(Some(evt)) => self.process_gossip(Ok(Some(evt))).await,
+                        Ok(None) => {
+                            log::info!("Gossip receiver closed; stopping daemon event loop");
+                            break;
+                        }
+                        Err(e) => self.process_gossip(Err(anyhow::anyhow!(e))).await,
+                    }
                 }
             }
         }
@@ -758,8 +752,24 @@ impl Context {
 
     pub async fn cleanup(&self) {
         let now = time_now();
-        self.pending_auth
-            .retain(|_, auth| now - auth.timestamp < 60 * 5);
+
+        let stale_node_ids = self
+            .nodes
+            .iter()
+            .filter_map(|pair| {
+                let node = pair.value();
+                if node.services.contains_key(SERVICE_MARKER_CLIENT) {
+                    return None;
+                }
+
+                (now.saturating_sub(node.last_heartbeat) > STALE_NODE_TTL_SECS)
+                    .then_some(*pair.key())
+            })
+            .collect::<Vec<_>>();
+
+        for node_id in stale_node_ids {
+            self.nodes.remove(&node_id);
+        }
 
         let nodes_snapshot = self
             .nodes
@@ -794,9 +804,7 @@ impl Context {
     async fn process_gossip(&self, evt: Result<Option<Event>>) {
         match evt {
             Ok(Some(evt)) => match evt {
-                Event::NeighborDown(endpoint_id) => {
-                    self.pending_auth.remove(&endpoint_id);
-                }
+                Event::NeighborDown(_endpoint_id) => {}
                 Event::Received(msg) => {
                     if let Ok((from, message, passed)) = self.decode_and_verify(msg.content) {
                         self.process_message(from, message, passed).await;
@@ -830,6 +838,7 @@ impl Context {
                 addr,
                 alias,
                 services,
+                invitor,
             } => {
                 if !self.ticket.validate(topic, rnum) {
                     log::error!("Received untrusted Invited message from {:?}", from);
@@ -847,14 +856,13 @@ impl Context {
 
                 let node = Node {
                     node_id: from,
-                    invitor: self.me.node_id,
+                    invitor,
                     addr,
                     domain: alias,
                     services,
                     last_heartbeat: time_now(),
                 };
 
-                self.pending_auth.remove(&from);
                 self.nodes.insert(from, node);
                 if let Some(node) = self.nodes.get(&from) {
                     self.static_provider.add_endpoint_info(node.addr.clone());
@@ -867,6 +875,11 @@ impl Context {
                 services,
                 invitor,
             } => {
+                if !passed {
+                    log::warn!("Ignoring untrusted AboutMe message from {:?}", from);
+                    return;
+                }
+
                 let addr = if addr.id == from {
                     addr
                 } else {
@@ -874,72 +887,29 @@ impl Context {
                 };
                 let addr = self.merge_existing_addr(&from, addr);
 
-                let node = Node {
-                    node_id: from,
-                    invitor,
-                    addr,
-                    domain: alias,
-                    services,
-                    last_heartbeat: 0,
-                };
-
-                if let Some(auth) = self.pending_auth.get(&from) {
-                    if auth.introduced {
-                        // Introduce already received; trust now.
-                        self.pending_auth.remove(&from);
-                        self.nodes.insert(from, node);
-                        if let Some(node) = self.nodes.get(&from) {
-                            self.static_provider.add_endpoint_info(node.addr.clone());
-                        }
-                    } else {
-                        // AboutMe repeated before Introduce; keep latest data.
-                        self.pending_auth.alter(&from, |_, auth| Auth {
-                            introducer: auth.introducer,
-                            introduced: false,
-                            node: Box::new(node).into(),
-                            timestamp: time_now(),
-                        });
+                if self.nodes.contains_key(&from) {
+                    let node = Node {
+                        node_id: from,
+                        invitor,
+                        addr,
+                        domain: alias,
+                        services,
+                        last_heartbeat: time_now(),
+                    };
+                    self.nodes.insert(from, node);
+                    if let Some(node) = self.nodes.get(&from) {
+                        self.static_provider.add_endpoint_info(node.addr.clone());
                     }
                 } else {
-                    // AboutMe arrived before Introduce.
-                    let auth = Auth {
-                        introducer: invitor,
-                        introduced: false,
-                        node: Box::new(node).into(),
-                        timestamp: time_now(),
-                    };
-                    self.pending_auth.insert(from, auth);
+                    log::warn!("Ignoring AboutMe for unknown node {:?}", from);
                 }
             }
             Message::Introduce { invited } => {
-                if !passed {
-                    log::error!("Received untrusted Introduce message from {:?}", from);
-                    return;
-                }
-                log::info!("Received Introduce message from {:?}", from);
-                if let Some((id, auth)) = self.pending_auth.remove(&invited) {
-                    if let Some(node) = auth.node {
-                        let mut node = *node;
-                        node.addr = self.merge_existing_addr(&id, node.addr.clone());
-                        self.nodes.insert(id, node);
-                    } else {
-                        let auth = Auth {
-                            introducer: from,
-                            introduced: true,
-                            node: None,
-                            timestamp: time_now(),
-                        };
-                        self.pending_auth.insert(invited, auth);
-                    }
-                } else {
-                    let auth = Auth {
-                        introducer: from,
-                        introduced: true,
-                        node: None,
-                        timestamp: time_now(),
-                    };
-                    self.pending_auth.insert(invited, auth);
-                }
+                log::debug!(
+                    "Ignoring legacy Introduce message from {:?} for {:?}",
+                    from,
+                    invited
+                );
             }
             Message::Heartbeat => {}
             Message::Left => {
@@ -947,6 +917,8 @@ impl Context {
                     log::error!("Received untrusted Left message from {:?}", from);
                     return;
                 }
+                self.nodes.remove(&from);
+                log::info!("Node {} left the network", from);
             }
             Message::SyncRequest { nodes } => {
                 if !self.args.daemon || passed {
