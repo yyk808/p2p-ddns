@@ -23,6 +23,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  P2P_DDNS_NO_MDNS: "1"
 
 jobs:
   smoke:

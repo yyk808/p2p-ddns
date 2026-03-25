@@ -93,15 +93,19 @@ mod tests {
 
     #[test]
     fn storage_db_path_accepts_db_file_config() {
-        let mut args = DaemonArgs::default();
-        args.config = Some(PathBuf::from("/tmp/p2p-ddns.db"));
+        let args = DaemonArgs {
+            config: Some(PathBuf::from("/tmp/p2p-ddns.db")),
+            ..DaemonArgs::default()
+        };
         assert_eq!(storage_db_path(&args), PathBuf::from("/tmp/p2p-ddns.db"));
     }
 
     #[test]
     fn storage_db_path_uses_dir_config() {
-        let mut args = DaemonArgs::default();
-        args.config = Some(PathBuf::from("/tmp/p2p-ddns"));
+        let args = DaemonArgs {
+            config: Some(PathBuf::from("/tmp/p2p-ddns")),
+            ..DaemonArgs::default()
+        };
         assert_eq!(
             storage_db_path(&args),
             PathBuf::from("/tmp/p2p-ddns").join("storage.db")

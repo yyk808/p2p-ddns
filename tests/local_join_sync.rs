@@ -9,29 +9,33 @@ async fn local_join_sync_over_ipv4_loopback() -> Result<()> {
     let dir_a = tempfile::tempdir()?;
     let dir_b = tempfile::tempdir()?;
 
-    let mut args_a = DaemonArgs::default();
-    args_a.daemon = false;
-    args_a.primary = true;
-    args_a.domain = Some("a".to_string());
-    args_a.config = Some(dir_a.path().to_path_buf());
-    args_a.bind = Some("127.0.0.1:0".to_string());
-    args_a.no_mdns = true;
-    args_a.dht = false;
+    let args_a = DaemonArgs {
+        daemon: false,
+        primary: true,
+        domain: Some("a".to_string()),
+        config: Some(dir_a.path().to_path_buf()),
+        bind: Some("127.0.0.1:0".to_string()),
+        no_mdns: true,
+        dht: false,
+        ..DaemonArgs::default()
+    };
     DaemonArgs::validate(&args_a)?;
 
     let storage_a = Storage::new(dir_a.path().join("storage.db"))?;
     let (ctx_a, gos_a, sp_a) = init_network(args_a, storage_a).await?;
     let ticket = ctx_a.ticket.to_string();
 
-    let mut args_b = DaemonArgs::default();
-    args_b.daemon = false;
-    args_b.primary = false;
-    args_b.domain = Some("b".to_string());
-    args_b.ticket = Some(ticket);
-    args_b.config = Some(dir_b.path().to_path_buf());
-    args_b.bind = Some("127.0.0.1:0".to_string());
-    args_b.no_mdns = true;
-    args_b.dht = false;
+    let args_b = DaemonArgs {
+        daemon: false,
+        primary: false,
+        domain: Some("b".to_string()),
+        ticket: Some(ticket),
+        config: Some(dir_b.path().to_path_buf()),
+        bind: Some("127.0.0.1:0".to_string()),
+        no_mdns: true,
+        dht: false,
+        ..DaemonArgs::default()
+    };
     DaemonArgs::validate(&args_b)?;
 
     let storage_b = Storage::new(dir_b.path().join("storage.db"))?;

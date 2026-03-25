@@ -100,6 +100,11 @@ setup_config() {
         ARGS+=("--bind" "$P2P_DDNS_BIND_ADDRESS")
     fi
 
+    if bool "${P2P_DDNS_NO_MDNS:-0}"; then
+        log "Disabling mDNS discovery"
+        ARGS+=("--no-mdns")
+    fi
+
     if bool "${P2P_DDNS_HOSTS_SYNC:-1}"; then
         log "Enabling hosts synchronization"
         ARGS+=("--hosts-sync")
