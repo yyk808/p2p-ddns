@@ -17,7 +17,12 @@ use crate::{
 };
 
 #[derive(Parser, Debug, Clone)]
-#[command(version, about = "p2p-ddns local management client", long_about = None)]
+#[command(
+    name = "p2p-ddnsctl",
+    version,
+    about = "p2p-ddns local management client",
+    long_about = None
+)]
 pub struct ClientArgs {
     /// Path to daemon's Unix socket; defaults to XDG_RUNTIME_DIR or /run.
     #[arg(long, value_name = "SOCKET_PATH")]
