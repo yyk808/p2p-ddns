@@ -44,6 +44,8 @@ use crate::{
 };
 
 const STALE_NODE_TTL_SECS: u64 = 90;
+const STATE_BROADCAST_INTERVAL_SECS: u64 = 30;
+const FULL_SYNC_INTERVAL_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -572,7 +574,8 @@ impl Context {
     }
 
     pub async fn run(&self, mut gos_recv: GossipReceiver, mut sp_recv: Receiver<Bytes>) {
-        let mut cron_jobs = interval(std::time::Duration::from_secs(30));
+        let mut state_broadcast = interval(Duration::from_secs(STATE_BROADCAST_INTERVAL_SECS));
+        let mut full_sync = interval(Duration::from_secs(FULL_SYNC_INTERVAL_SECS));
         let interactive = std::io::stdin().is_terminal();
         let mut ctrlc = Box::pin(tokio::signal::ctrl_c()).fuse();
         let mut sigterm = Box::pin(async {
@@ -599,10 +602,7 @@ impl Context {
 
         // Errors are expected if we are the first node in network.
         // TODO: a smarter sync strategy
-        let sync_req = Message::SyncRequest {
-            nodes: Default::default(),
-        };
-        let _ = self.broadcast_neighbor_message(sync_req).await;
+        self.request_neighbor_sync().await;
 
         loop {
             futures::select! {
@@ -632,14 +632,18 @@ impl Context {
                     self.graceful_shutdown().await;
                     break;
                 },
-                _ = cron_jobs.tick().fuse() => {
+                _ = state_broadcast.tick().fuse() => {
                     if self.args.daemon && !self.is_paused() {
-                        let _ = self.broadcast_message(Message::Heartbeat).await;
-                        self.update_nodes().await;
+                        self.broadcast_state_update().await;
                     }
                     self.cleanup().await;
                     if let Err(e) = self.save().await {
                         log::error!("Failed to save nodes to storage: {:?}", e);
+                    }
+                },
+                _ = full_sync.tick().fuse() => {
+                    if self.args.daemon && !self.is_paused() {
+                        self.request_neighbor_sync().await;
                     }
                 },
                 bmsg = sp_recv.next().fuse() => {
@@ -680,24 +684,20 @@ impl Context {
         duration: Duration,
     ) {
         let deadline = tokio::time::Instant::now() + duration;
-        let mut cron_jobs = interval(Duration::from_millis(200));
+        let mut state_broadcast = interval(Duration::from_millis(200));
+        let mut full_sync = interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
-                _ = cron_jobs.tick() => {
+                _ = state_broadcast.tick() => {
                     if self.args.daemon {
-                        let mut me = (*self.me).clone();
-                        me.addr = self.handle.addr();
-                        me.last_heartbeat = time_now();
-
-                        let nodes = self
-                            .nodes
-                            .iter()
-                            .map(|it| it.value().clone())
-                            .chain([me])
-                            .collect::<Vec<_>>();
-                        let _ = self.broadcast_neighbor_message(Message::SyncRequest { nodes }).await;
+                        self.broadcast_state_update().await;
+                    }
+                }
+                _ = full_sync.tick() => {
+                    if self.args.daemon {
+                        self.request_neighbor_sync().await;
                     }
                 }
                 bmsg = sp_recv.next() => {
@@ -785,19 +785,28 @@ impl Context {
         let _ = timeout(Duration::from_secs(1), self.handle.network_change()).await;
     }
 
-    pub async fn update_nodes(&self) {
+    fn current_node_state(&self) -> Node {
         let mut me = (*self.me).clone();
         me.addr = self.handle.addr();
         me.last_heartbeat = time_now();
+        me
+    }
 
-        let nodes = self
-            .nodes
-            .iter()
-            .map(|it| it.value().clone())
-            .chain([me])
-            .collect::<Vec<_>>();
+    pub async fn broadcast_state_update(&self) {
+        let me = self.current_node_state();
         let _ = self
-            .broadcast_neighbor_message(Message::SyncRequest { nodes })
+            .broadcast_message(Message::AboutMe {
+                addr: me.addr,
+                alias: me.domain,
+                services: me.services,
+                invitor: me.invitor,
+            })
+            .await;
+    }
+
+    pub async fn request_neighbor_sync(&self) {
+        let _ = self
+            .broadcast_neighbor_message(Message::SyncRequest { nodes: vec![] })
             .await;
     }
 
