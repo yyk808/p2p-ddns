@@ -26,6 +26,8 @@ P2P_DDNS_ROLE=primary
 # P2P_DDNS_NO_MDNS=0
 # P2P_DDNS_DHT=0
 # P2P_DDNS_ADMIN_HTTP=127.0.0.1:8080
+# Hosts sync updates the system hosts file; keep it disabled unless this service should manage
+# local name resolution on the machine.
 # P2P_DDNS_HOSTS_SYNC=1
 # P2P_DDNS_HOSTS_SUFFIX=p2p
 #
