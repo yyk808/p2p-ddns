@@ -453,17 +453,14 @@ docker logs --tail 200:\n{}",
 
 async fn primary_list(
     primary: &testcontainers::ContainerAsync<GenericImage>,
-    ticket: &str,
+    _ticket: &str,
 ) -> Result<String> {
     exec_stdout(
         primary,
         vec![
-            "p2p-ddns".to_string(),
-            "--client".to_string(),
+            "p2p-ddnsctl".to_string(),
             "--socket-path".to_string(),
             "/tmp/p2p-ddns.sock".to_string(),
-            "--ticket".to_string(),
-            ticket.to_string(),
             "list".to_string(),
         ],
     )

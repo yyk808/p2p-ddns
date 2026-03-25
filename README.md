@@ -56,10 +56,15 @@ cargo build
 
 ## Usage
 
+Installed binaries:
+
+- `p2p-ddns`: daemon/node process
+- `p2p-ddnsctl`: local management client
+
 ### Start a new network
 
 ```bash
-cargo run -- --daemon --primary --domain mynode
+cargo run --bin p2p-ddns -- --primary --domain mynode
 ```
 
 The primary daemon prints `Ticket (raw): <TICKET_STRING>` on startup. Copy that value and use it
@@ -68,7 +73,7 @@ to join other daemons.
 ### Join an existing network
 
 ```bash
-cargo run -- --daemon --ticket <TICKET_STRING> --domain mynode
+cargo run --bin p2p-ddns -- --ticket <TICKET_STRING> --domain mynode
 ```
 
 ### Query a running daemon from the local machine
@@ -78,9 +83,9 @@ default. A ticket is still required when adding other daemons to the network or 
 optional HTTP admin endpoint.
 
 ```bash
-cargo run -- --client status
-cargo run -- --client list
-cargo run -- --client get-ticket
+cargo run --bin p2p-ddnsctl -- status
+cargo run --bin p2p-ddnsctl -- list
+cargo run --bin p2p-ddnsctl -- get-ticket
 ```
 
 ### Enable hosts-based DDNS
@@ -88,19 +93,19 @@ cargo run -- --client get-ticket
 To write synchronized records into the system hosts file:
 
 ```bash
-sudo cargo run -- --daemon --primary --domain mynode --hosts-sync
+sudo cargo run --bin p2p-ddns -- --primary --domain mynode --hosts-sync
 ```
 
 To also publish a suffix form such as `mynode.p2p`:
 
 ```bash
-sudo cargo run -- --daemon --ticket <TICKET_STRING> --domain mynode --hosts-sync --hosts-suffix p2p
+sudo cargo run --bin p2p-ddns -- --ticket <TICKET_STRING> --domain mynode --hosts-sync --hosts-suffix p2p
 ```
 
 To test safely without touching `/etc/hosts`, point hosts sync at a temporary file:
 
 ```bash
-cargo run -- --daemon --primary --domain mynode --hosts-sync --hosts-path /tmp/p2p-ddns.hosts
+cargo run --bin p2p-ddns -- --primary --domain mynode --hosts-sync --hosts-path /tmp/p2p-ddns.hosts
 ```
 
 ### Useful daemon options

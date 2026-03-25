@@ -10,7 +10,10 @@ COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    mkdir -p src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs && \
+    mkdir -p src src/bin && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "fn main() {}" > src/bin/p2p-ddnsctl.rs && \
+    echo "" > src/lib.rs && \
     cargo build --release && \
     rm -rf src
 
@@ -22,10 +25,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     # Docker preserves file mtimes from the build context; if they are older than the
     # pre-cache build artifacts, cargo can incorrectly consider the crate "fresh" and
     # skip rebuilding (leaving the dummy binary in place).
-    touch src/main.rs src/lib.rs && \
+    find src -type f -exec touch {} + && \
     cargo build --release && \
     /app/target/release/p2p-ddns --version | grep -q '^p2p-ddns ' && \
-    cp /app/target/release/p2p-ddns /app/bin/p2p-ddns
+    /app/target/release/p2p-ddnsctl --version | grep -q '^p2p-ddnsctl ' && \
+    cp /app/target/release/p2p-ddns /app/bin/p2p-ddns && \
+    cp /app/target/release/p2p-ddnsctl /app/bin/p2p-ddnsctl
 
 FROM debian:bookworm-slim AS runtime
 
@@ -46,6 +51,7 @@ RUN useradd -m -u 1000 testuser
 
 # Copy built binary
 COPY --from=builder /app/bin/p2p-ddns /usr/local/bin/p2p-ddns
+COPY --from=builder /app/bin/p2p-ddnsctl /usr/local/bin/p2p-ddnsctl
 
 # Set up directories
 RUN mkdir -p /app/data /app/logs /app/config /shared && \

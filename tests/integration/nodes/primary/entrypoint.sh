@@ -75,7 +75,7 @@ setup_config() {
     mkdir -p /app/data
     
     # Build command line arguments
-    ARGS=("--daemon" "--primary" "--config" "/app/data")
+    ARGS=("--primary" "--config" "/app/data")
     
     # Set log level from environment if provided
     if [[ -n "${P2P_DDNS_LOG_LEVEL:-}" ]]; then

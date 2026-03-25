@@ -1,11 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 
-use p2p_ddns::{app, cli::args::DaemonArgs};
+use p2p_ddns::app::{self, ClientArgs};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = DaemonArgs::parse();
+    let args = ClientArgs::parse();
     app::init_logging(args.log);
-    app::run_daemon(args).await
+    app::run_client(args).await
 }
