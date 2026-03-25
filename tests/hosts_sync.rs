@@ -10,17 +10,19 @@ async fn hosts_sync_writes_and_cleans_managed_section_on_shutdown() -> Result<()
     let hosts_path = dir.path().join("hosts");
     std::fs::write(&hosts_path, "127.0.0.1 localhost\n")?;
 
-    let mut args = DaemonArgs::default();
-    args.daemon = false;
-    args.primary = true;
-    args.domain = Some("alpha".to_string());
-    args.config = Some(dir.path().to_path_buf());
-    args.bind = Some("127.0.0.1:0".to_string());
-    args.no_mdns = true;
-    args.dht = false;
-    args.hosts_sync = true;
-    args.hosts_path = Some(hosts_path.clone());
-    args.hosts_suffix = Some("p2p".to_string());
+    let args = DaemonArgs {
+        daemon: false,
+        primary: true,
+        domain: Some("alpha".to_string()),
+        config: Some(dir.path().to_path_buf()),
+        bind: Some("127.0.0.1:0".to_string()),
+        no_mdns: true,
+        dht: false,
+        hosts_sync: true,
+        hosts_path: Some(hosts_path.clone()),
+        hosts_suffix: Some("p2p".to_string()),
+        ..DaemonArgs::default()
+    };
     DaemonArgs::validate(&args)?;
 
     let storage = Storage::new(dir.path().join("storage.db"))?;

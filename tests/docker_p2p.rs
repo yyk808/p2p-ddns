@@ -90,6 +90,10 @@ fn env_bool(key: &str) -> bool {
     )
 }
 
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
 fn env_usize(key: &str) -> Result<Option<usize>> {
     let Ok(value) = env::var(key) else {
         return Ok(None);
@@ -397,10 +401,10 @@ fn extract_ticket(text: &str) -> Option<String> {
         if let Some(t) = extract_after_prefix(line, "New Ticket: ") {
             return Some(t);
         }
-        if let Some(t) = extract_after_prefix(line, "Ticket: ") {
-            if t.len() > 16 {
-                return Some(t);
-            }
+        if let Some(t) = extract_after_prefix(line, "Ticket: ")
+            && t.len() > 16
+        {
+            return Some(t);
         }
     }
     None
@@ -475,14 +479,11 @@ async fn wait_for_primary_converged(
     let deadline = Instant::now() + timeout;
     let mut last_out = String::new();
     loop {
-        match primary_list(primary, ticket).await {
-            Ok(out) => {
-                last_out = out.clone();
-                if expected_names.iter().all(|n| out.contains(n)) {
-                    return Ok(());
-                }
+        if let Ok(out) = primary_list(primary, ticket).await {
+            last_out = out.clone();
+            if expected_names.iter().all(|n| out.contains(n)) {
+                return Ok(());
             }
-            Err(_) => {}
         }
 
         if Instant::now() >= deadline {
@@ -627,18 +628,15 @@ async fn assert_primary_missing_for(
     let deadline = Instant::now() + duration;
     let mut last_out = String::new();
     loop {
-        match primary_list(primary, ticket).await {
-            Ok(out) => {
-                last_out = out.clone();
-                if forbidden_names.iter().any(|n| out.contains(n)) {
-                    anyhow::bail!(
-                        "primary unexpectedly listed a forbidden node; forbidden={:?}\n{}",
-                        forbidden_names,
-                        out
-                    );
-                }
+        if let Ok(out) = primary_list(primary, ticket).await {
+            last_out = out.clone();
+            if forbidden_names.iter().any(|n| out.contains(n)) {
+                anyhow::bail!(
+                    "primary unexpectedly listed a forbidden node; forbidden={:?}\n{}",
+                    forbidden_names,
+                    out
+                );
             }
-            Err(_) => {}
         }
 
         if Instant::now() >= deadline {
@@ -679,7 +677,7 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
         1
     };
     let primary = {
-        GenericImage::new("p2p-ddns-test-primary", tag)
+        let mut image = GenericImage::new("p2p-ddns-test-primary", tag)
             .with_container_name(primary_container_name.clone())
             .with_env_var("NODE_NAME", "primary-node")
             .with_env_var("P2P_DDNS_LOG_LEVEL", "debug")
@@ -687,10 +685,11 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
             .with_env_var("P2P_DDNS_BIND_ADDRESS", "0.0.0.0:7777")
             .with_env_var("P2P_DDNS_EXPECT_IPV4", primary_expected_ipv4.to_string())
             .with_env_var("XDG_RUNTIME_DIR", "/tmp")
-            .with_network(networks.first().context("missing primary network")?.clone())
-            .start()
-            .await
-            .context("start primary container")?
+            .with_network(networks.first().context("missing primary network")?.clone());
+        if let Some(v) = env_nonempty("P2P_DDNS_NO_MDNS") {
+            image = image.with_env_var("P2P_DDNS_NO_MDNS", v);
+        }
+        image.start().await.context("start primary container")?
     };
 
     // testcontainers-rs only attaches to one network at creation time; multi-home here.
@@ -733,7 +732,7 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
                 1
             };
 
-            let container = GenericImage::new("p2p-ddns-test-daemon", tag)
+            let mut image = GenericImage::new("p2p-ddns-test-daemon", tag)
                 .with_container_name(container_name)
                 .with_env_var("NODE_NAME", name.clone())
                 .with_env_var("P2P_DDNS_LOG_LEVEL", "info")
@@ -743,7 +742,11 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
                 .with_env_var("PRIMARY_HOST", primary_host_for_ping)
                 .with_env_var("P2P_DDNS_EXPECT_IPV4", expected_ipv4.to_string())
                 .with_env_var("XDG_RUNTIME_DIR", "/tmp")
-                .with_network(initial_network.clone())
+                .with_network(initial_network.clone());
+            if let Some(v) = env_nonempty("P2P_DDNS_NO_MDNS") {
+                image = image.with_env_var("P2P_DDNS_NO_MDNS", v);
+            }
+            let container = image
                 .start()
                 .await
                 .with_context(|| format!("start daemon container: {name}"))?;
@@ -858,52 +861,50 @@ async fn run_case(case: Case, tag: &str) -> Result<()> {
     }
     .await;
 
-    if res.is_err() {
-        if let Some(ticket) = ticket_for_debug.as_deref() {
-            if let Ok(out) = primary_list(&primary, ticket).await {
-                let expected = daemon_names(case.daemon_count);
-                let missing = expected
-                    .iter()
-                    .filter(|n| !out.contains(n.as_str()))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                eprintln!("Primary list (debug):\n{out}");
+    if res.is_err()
+        && let Some(ticket) = ticket_for_debug.as_deref()
+        && let Ok(out) = primary_list(&primary, ticket).await
+    {
+        let expected = daemon_names(case.daemon_count);
+        let missing = expected
+            .iter()
+            .filter(|n| !out.contains(n.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        eprintln!("Primary list (debug):\n{out}");
 
-                for name in missing {
-                    let idx = name
-                        .strip_prefix("daemon-")
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .and_then(|n| n.checked_sub(1));
-                    let Some(idx) = idx else {
-                        continue;
-                    };
-                    let Some(daemon) = daemons.get(idx) else {
-                        continue;
-                    };
-                    let tail = docker_logs_tail(daemon.id(), 200).unwrap_or_else(|e| {
-                        format!("(failed to read docker logs for {name}: {e:#})")
-                    });
-                    let mut excerpt = String::new();
-                    for line in tail.lines() {
-                        if line.contains("p2p_ddns") || line.contains("Timeout joining gossip") {
-                            excerpt.push_str(line);
-                            excerpt.push('\n');
-                        }
-                    }
-                    if excerpt.trim().is_empty() {
-                        excerpt = tail
-                            .lines()
-                            .rev()
-                            .take(40)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                    }
-                    eprintln!("----- {name} logs (filtered) -----\n{excerpt}");
+        for name in missing {
+            let idx = name
+                .strip_prefix("daemon-")
+                .and_then(|s| s.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1));
+            let Some(idx) = idx else {
+                continue;
+            };
+            let Some(daemon) = daemons.get(idx) else {
+                continue;
+            };
+            let tail = docker_logs_tail(daemon.id(), 200)
+                .unwrap_or_else(|e| format!("(failed to read docker logs for {name}: {e:#})"));
+            let mut excerpt = String::new();
+            for line in tail.lines() {
+                if line.contains("p2p_ddns") || line.contains("Timeout joining gossip") {
+                    excerpt.push_str(line);
+                    excerpt.push('\n');
                 }
             }
+            if excerpt.trim().is_empty() {
+                excerpt = tail
+                    .lines()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            eprintln!("----- {name} logs (filtered) -----\n{excerpt}");
         }
     }
 

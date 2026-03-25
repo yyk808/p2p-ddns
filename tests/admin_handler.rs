@@ -14,16 +14,18 @@ use tempfile::tempdir;
 
 async fn make_context() -> Result<(p2p_ddns::net::Context, Arc<ClientRegistry>)> {
     let dir = tempdir()?;
-    let mut args = DaemonArgs::default();
-    args.daemon = true;
-    args.primary = true;
-    args.domain = Some("a".to_string());
-    args.config = Some(dir.path().to_path_buf());
-    args.bind = Some("127.0.0.1:0".to_string());
-    args.no_mdns = true;
-    args.dht = false;
-    args.hosts_sync = true;
-    args.hosts_path = Some(dir.path().join("hosts"));
+    let args = DaemonArgs {
+        daemon: true,
+        primary: true,
+        domain: Some("a".to_string()),
+        config: Some(dir.path().to_path_buf()),
+        bind: Some("127.0.0.1:0".to_string()),
+        no_mdns: true,
+        dht: false,
+        hosts_sync: true,
+        hosts_path: Some(dir.path().join("hosts")),
+        ..DaemonArgs::default()
+    };
     DaemonArgs::validate(&args)?;
 
     let storage = Storage::new(dir.path().join("storage.db"))?;
