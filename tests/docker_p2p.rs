@@ -375,11 +375,16 @@ fn extract_ticket(text: &str) -> Option<String> {
     }
 
     for line in text.lines().rev() {
+        if let Some(t) = extract_after_prefix(line, "Ticket (raw): ") {
+            return Some(t);
+        }
         if let Some(t) = extract_after_prefix(line, "New Ticket: ") {
             return Some(t);
         }
         if let Some(t) = extract_after_prefix(line, "Ticket: ") {
-            return Some(t);
+            if t.len() > 16 {
+                return Some(t);
+            }
         }
     }
     None
