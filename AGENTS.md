@@ -87,9 +87,9 @@ pub fn do_something() -> Result<()> {
 
 ### Async Code
 - Use `async fn` for async functions
-- Use `#[compio::main]` or `#[compio::test]` for entry points
+- Use `#[tokio::main]` or `#[tokio::test]` for entry points
 - Always use `.await` (not `block_on`)
-- Use compio's async types (futures::channel, compio::runtime::time)
+- Prefer the existing `tokio` + `futures` patterns already used in the codebase
 
 ### Visibility and Structure
 - Mark items `pub` only when needed for external access
@@ -125,7 +125,7 @@ pub fn do_something() -> Result<()> {
 - Write unit tests in `#[cfg(test)]` modules within files
 - Use `tempfile::tempfile()` for temporary file tests
 - Use `#[test]` attribute for sync tests
-- Use `#[compio::test]` for async tests
+- Use `#[tokio::test]` for async tests
 - Comment out broken tests with `// #[test]` rather than removing
 
 ### Documentation
@@ -136,7 +136,7 @@ pub fn do_something() -> Result<()> {
 
 ## Project-Specific Conventions
 
-- **Runtime**: Uses `compio` async runtime (not tokio)
+- **Runtime**: Uses `tokio` async runtime
 - **Storage**: Uses `redb` embedded database
 - **Networking**: Uses `iroh` P2P networking library
 - **CLI**: Uses `clap` with derive features
@@ -150,7 +150,7 @@ Core dependencies to understand before using:
 - `redb` - Embedded database
 - `postcard` - Binary serialization
 - `parking_lot` - Fast synchronization primitives
-- `compio` - Async runtime
+- `tokio` - Async runtime
 
 ## Before Committing
 Always run:

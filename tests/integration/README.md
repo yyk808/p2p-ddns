@@ -8,6 +8,9 @@ multi-homed nodes) using Docker network isolation.
 
 ## Run (recommended)
 
+These tests require a working local Docker daemon. When Docker is unavailable, the Rust test entry
+points skip instead of failing the default repository test run.
+
 Smoke test (single case):
 
 ```bash

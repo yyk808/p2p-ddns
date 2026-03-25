@@ -1,76 +1,113 @@
-# p2p-ddns2
+# p2p-ddns
 
-A peer-to-peer Dynamic DNS (DDNS) service project.
+A peer-to-peer node directory and address synchronization daemon for unstable or segmented networks.
 
-## What is this for?
-Managing numerous network devices that lack GUIs can be challenging as they can only be accessed remotely (e.g., via SSH). In large public networks (such as campus networks) with DHCP enabled, devices may receive different IP addresses upon reconnection. Moreover, these networks often use multi-layered, tree-structured architectures with extensive router-isolated broadcast domains, making simple multicast-based device discovery unfeasible.
+## What It Is
 
-This project addresses these challenges by providing a robust DDNS solution.
+`p2p-ddns` helps a group of machines learn and keep track of each other's current addresses when:
 
-## What is this NOT for?
-- Proxy service
-- NAT traversal
+- hosts frequently change IPs because of DHCP
+- the network is split across multiple broadcast domains
+- you do not want to depend on a central coordination service
+
+Today, the project's core function is P2P membership and address synchronization. It maintains a
+shared view of known nodes and exposes that state through local management APIs.
+
+## What It Is Not
+
+- Not a proxy service
+- Not a NAT traversal product by itself
+- Not a full DNS server today
+
+There is a reusable hosts-file helper in the codebase, but the daemon does not currently wire node
+state into `/etc/hosts` or a DNS responder automatically.
 
 ## Features
-- Peer-to-peer network for DDNS record synchronization.
-- Pure Rust implementation, easy cross platform deployment.
-- Using QUIC protocol for secure and fast communication.
 
-## Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yyk808/p2p-ddns.git
-   ```
-2. Navigate to the project directory:
-   ```bash
-   cd p2p-ddns
-   ```
-3. Build:
-   ```bash
-   cargo build
-   ```
+- P2P node discovery and record synchronization over QUIC
+- Offline-first operation on LANs via mDNS and static bootstrap tickets
+- Optional relay / DHT support for harder network topologies
+- Embedded persistence with `redb`
+- Local management over Unix socket, plus optional HTTP admin endpoint
+- Pure Rust implementation for cross-platform deployment
 
-## Key Concepts
-- Peer-to-peer communication enables direct record synchronization among devices.
-- The project leverages QUIC protocol for secure and fast communication.
-- Pure Rust implementation ensures easy cross-platform deployment and robust performance.
+## Architecture
 
-## Usage
-### Running Modes
-The project supports two running modes:
-- Daemon mode: In this mode the program will publish its own domain name and synchronize information with other nodes. Use the "--daemon" flag along with options like "--alias" to set the node name and optionally "--primary" if it is the first node. For example:
-   ```bash
-   ./p2p-ddns2 --daemon --alias mynode --primary
-   ```
-   You can also use the "--ticket" option to join an existing network:
-   ```bash
-   ./p2p-ddns2 --daemon --ticket <TICKET_STRING> --alias mynode
-   ```
-- Client mode: In this mode the program only synchronizes information from daemon nodes and does not publish its own domain name. For example:
-   ```bash
-   ./p2p-ddns2 --ticket <TICKET_STRING>
-   ```
+- `daemon` mode runs the P2P node plus management servers
+- `client` mode talks to a running daemon over the local admin API
+- `Ticket` values act as bootstrap credentials for joining an existing network
+- Node state is synchronized with `iroh-gossip` broadcasts plus direct point-to-point messages
 
-Additional options such as "--bind" for specifying the bind address and "--config" for a custom configuration path are available.
+## Build
 
-```log
-Usage: p2p-ddns [OPTIONS]
-
-Options:
-  -d, --daemon                Running mode, daemon or client(default)
-      --primary               To be the first node in this p2p network
-  -a, --alias <NICKNAME>      Name of this node, used in dns resolving
-  -t, --ticket <TICKET>       Use ticket string to join a existing network
-  -c, --config <CONFIG_PATH>  Manually specify the path of the database file
-  -L, --log <LOG>             Log level, default is info [default: info] [possible values: trace, debug, info, warn, error, off]
-  -B, --bind <BIND_ADDR>
-      --debug                 For debug convinience
-  -h, --help                  Print help
-  -V, --version               Print version
+```bash
+cargo build
 ```
 
-## License
-This project is licensed under the MIT License. Please refer to the [LICENCE](LICENCE) file for details.
+## Usage
 
-## Maintainers
-This project is developed and maintained by Neon.
+### Start a new network
+
+```bash
+cargo run -- --daemon --primary --domain mynode
+```
+
+### Join an existing network
+
+```bash
+cargo run -- --daemon --ticket <TICKET_STRING> --domain mynode
+```
+
+### Query a running daemon from the local machine
+
+```bash
+cargo run -- --client --ticket <TICKET_STRING> status
+cargo run -- --client --ticket <TICKET_STRING> list
+cargo run -- --client --ticket <TICKET_STRING> get-ticket
+```
+
+### Useful daemon options
+
+- `--bind <ADDR>`: bind the P2P endpoint to a specific address
+- `--config <DIR>`: set the storage directory
+- `--no-mdns`: disable local-network discovery
+- `--dht`: enable PKARR/DHT discovery when built with `--features pkarr-dht`
+- `--admin-http <ADDR>`: expose the admin API over HTTP
+- `--relay-mode <disabled|default|staging>`: configure relay usage
+- `--relay-url <URL>`: use one or more self-hosted relays
+- `--reset-storage`: intentionally wipe persisted node/topic/ticket state before startup
+
+### Example admin flow
+
+1. Start a primary daemon.
+2. Fetch its ticket with `get-ticket`.
+3. Start other daemons with that ticket.
+4. Use `list` or `status` from `client` mode to inspect the network.
+
+## Testing
+
+Run the default test suite:
+
+```bash
+cargo test
+```
+
+Docker-backed topology tests are available separately and auto-skip when Docker is unavailable:
+
+```bash
+cargo test --test docker_p2p -- --nocapture
+```
+
+See [tests/integration/README.md](tests/integration/README.md) for the Docker topology matrix.
+
+## Tech Stack
+
+- Runtime: `tokio`
+- Networking: `iroh`, `iroh-gossip`
+- Storage: `redb`
+- Serialization: `postcard`
+- CLI: `clap`
+
+## License
+
+This project is licensed under the MIT License. See [LICENCE](LICENCE).
