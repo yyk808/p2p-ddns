@@ -7,7 +7,7 @@ use tokio::net::UnixListener;
 use crate::{
     admin::{
         authz::ClientRegistry,
-        handler::{self, AdminAction},
+        handler::{self, AdminAction, AuthMode},
         protocol::*,
     },
     net::Context,
@@ -84,8 +84,12 @@ async fn handle_client_connection(
         }
     };
 
-    let (response, client_id) = match handler::authenticate_and_register(&ctx, &clients, &auth_req)
-    {
+    let (response, client_id) = match handler::authenticate_and_register(
+        &ctx,
+        &clients,
+        &auth_req,
+        AuthMode::AllowLocalTicketless,
+    ) {
         Ok(res) => res,
         Err(e) => {
             error!("Auth handling error: {}", e);

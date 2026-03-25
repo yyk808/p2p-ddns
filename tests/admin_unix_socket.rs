@@ -111,7 +111,7 @@ async fn unix_socket_management_roundtrip_get_ticket() -> Result<()> {
 }
 
 #[tokio::test]
-async fn unix_socket_auth_rejects_invalid_ticket() -> Result<()> {
+async fn unix_socket_allows_missing_ticket_for_local_client() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
 
     let sock_dir = tempdir()?;
@@ -132,7 +132,7 @@ async fn unix_socket_auth_rejects_invalid_ticket() -> Result<()> {
     let sk = SecretKey::generate(&mut rng);
     let pk = sk.public();
     let auth = AuthRequest {
-        ticket: "not-a-ticket".to_string(),
+        ticket: String::new(),
         client_public_key: Some(
             base64::engine::general_purpose::STANDARD_NO_PAD.encode(pk.as_bytes()),
         ),
@@ -141,7 +141,15 @@ async fn unix_socket_auth_rejects_invalid_ticket() -> Result<()> {
 
     send_message(&mut stream, &auth).await?;
     let resp: AuthResponse = read_message(&mut stream).await?;
-    assert!(!resp.success);
+    assert!(resp.success);
+
+    send_message(&mut stream, &ClientCommand::GetTicket).await?;
+    let resp: ClientResponse = read_message(&mut stream).await?;
+    let got = match resp {
+        ClientResponse::Ticket(t) => t,
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    };
+    assert_eq!(got, ctx.ticket.to_string());
 
     srv.abort();
     Ok(())

@@ -43,8 +43,34 @@ async fn auth_rejects_invalid_ticket() -> Result<()> {
         client_name: None,
     };
 
-    let (resp, id) = handler::authenticate_and_register(&ctx, &clients, &auth_req)?;
+    let (resp, id) = handler::authenticate_and_register(
+        &ctx,
+        &clients,
+        &auth_req,
+        handler::AuthMode::RequireTicket,
+    )?;
     assert!(!resp.success);
+    assert!(id.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_allows_ticketless_local_mode() -> Result<()> {
+    let (ctx, clients) = make_context().await?;
+
+    let auth_req = AuthRequest {
+        ticket: String::new(),
+        client_public_key: None,
+        client_name: None,
+    };
+
+    let (resp, id) = handler::authenticate_and_register(
+        &ctx,
+        &clients,
+        &auth_req,
+        handler::AuthMode::AllowLocalTicketless,
+    )?;
+    assert!(resp.success);
     assert!(id.is_none());
     Ok(())
 }
@@ -64,7 +90,12 @@ async fn auth_registers_client_and_query_excludes_client_nodes() -> Result<()> {
         client_name: Some("cli".to_string()),
     };
 
-    let (resp, id) = handler::authenticate_and_register(&ctx, &clients, &auth_req)?;
+    let (resp, id) = handler::authenticate_and_register(
+        &ctx,
+        &clients,
+        &auth_req,
+        handler::AuthMode::RequireTicket,
+    )?;
     assert!(resp.success);
     let id = id.expect("client id");
     assert_eq!(id, pk);

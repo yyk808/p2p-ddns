@@ -10,7 +10,7 @@ use tokio::{
 use crate::{
     admin::{
         authz::ClientRegistry,
-        handler::{self, AdminAction},
+        handler::{self, AdminAction, AuthMode},
         protocol::{AdminCommandRequest, AuthRequest, ClientResponse},
     },
     net::Context,
@@ -60,15 +60,23 @@ async fn handle_connection(
     match path.as_str() {
         "/auth" => {
             let auth_req: AuthRequest = postcard::from_bytes(&body)?;
-            let (auth_resp, _client_id) =
-                handler::authenticate_and_register(ctx, clients, &auth_req)?;
+            let (auth_resp, _client_id) = handler::authenticate_and_register(
+                ctx,
+                clients,
+                &auth_req,
+                AuthMode::RequireTicket,
+            )?;
             let resp_body = postcard::to_stdvec(&auth_resp)?;
             write_response(stream, 200, "application/postcard", &resp_body).await
         }
         "/command" => {
             let req: AdminCommandRequest = postcard::from_bytes(&body)?;
-            let (auth_resp, client_id) =
-                handler::authenticate_and_register(ctx, clients, &req.auth)?;
+            let (auth_resp, client_id) = handler::authenticate_and_register(
+                ctx,
+                clients,
+                &req.auth,
+                AuthMode::RequireTicket,
+            )?;
             if !auth_resp.success {
                 let resp_body = postcard::to_stdvec(&auth_resp)?;
                 return write_response(stream, 401, "application/postcard", &resp_body).await;

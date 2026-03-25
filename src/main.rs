@@ -187,14 +187,10 @@ async fn run_client(args: AppArgs) -> Result<()> {
         anyhow::anyhow!("Missing client command. Example: `p2p-ddns --client --socket /run/p2p-ddns.sock status`")
     })?;
 
-    let ticket = match args.node.ticket.clone() {
-        Some(t) => t,
-        None => get_ticket()?,
-    };
-
     let socket_path = get_socket_path(&args.socket_path);
     let mut stream = connect_to_daemon(&socket_path, args.timeout).await?;
-    let _client_pk = authenticate(&mut stream, &ticket).await?;
+    let ticket = args.node.ticket.clone().or_else(|| get_ticket().ok());
+    let _client_pk = authenticate(&mut stream, ticket.as_deref()).await?;
     execute_command(&mut stream, cmd).await?;
     Ok(())
 }
@@ -284,7 +280,7 @@ async fn connect_to_daemon(
 
 async fn authenticate(
     stream: &mut tokio::net::UnixStream,
-    ticket: &str,
+    ticket: Option<&str>,
 ) -> Result<iroh::PublicKey> {
     let storage = init_client_storage().await?;
     let (pk, _sk) = storage.load_secret()?.unwrap_or_else(|| {
@@ -296,7 +292,7 @@ async fn authenticate(
     });
 
     let auth_req = AuthRequest {
-        ticket: ticket.to_string(),
+        ticket: ticket.unwrap_or_default().to_string(),
         client_public_key: Some(
             base64::engine::general_purpose::STANDARD_NO_PAD.encode(pk.as_bytes()),
         ),

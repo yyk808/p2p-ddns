@@ -234,6 +234,41 @@ async fn http_command_rejects_invalid_ticket() -> Result<()> {
 }
 
 #[tokio::test]
+async fn http_command_rejects_missing_ticket() -> Result<()> {
+    let (ctx, clients) = make_ctx_and_clients().await?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+
+    let srv = tokio::spawn({
+        let ctx = ctx.clone();
+        let clients = clients.clone();
+        async move {
+            let _ = http::run_http_server(addr, ctx, clients).await;
+        }
+    });
+
+    let req = AdminCommandRequest {
+        auth: AuthRequest {
+            ticket: String::new(),
+            client_public_key: None,
+            client_name: None,
+        },
+        command: ClientCommand::GetTicket,
+    };
+    let body = postcard::to_stdvec(&req)?;
+    let (status, resp_body) =
+        send_http_post(addr, "/command", "application/postcard", &body).await?;
+    assert_eq!(status, 401);
+    let auth_resp: AuthResponse = postcard::from_bytes(&resp_body)?;
+    assert!(!auth_resp.success);
+
+    srv.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn http_command_requires_client_public_key() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
 

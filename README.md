@@ -63,7 +63,7 @@ cargo run -- --daemon --primary --domain mynode
 ```
 
 The primary daemon prints `Ticket (raw): <TICKET_STRING>` on startup. Copy that value and use it
-to join other daemons or authenticate local admin client commands.
+to join other daemons.
 
 ### Join an existing network
 
@@ -73,12 +73,14 @@ cargo run -- --daemon --ticket <TICKET_STRING> --domain mynode
 
 ### Query a running daemon from the local machine
 
-`client` mode requires a valid network ticket for authentication.
+`client` mode talks to the local daemon over a Unix socket and does not require a ticket by
+default. A ticket is still required when adding other daemons to the network or when using the
+optional HTTP admin endpoint.
 
 ```bash
-cargo run -- --client --ticket <TICKET_STRING> status
-cargo run -- --client --ticket <TICKET_STRING> list
-cargo run -- --client --ticket <TICKET_STRING> get-ticket
+cargo run -- --client status
+cargo run -- --client list
+cargo run -- --client get-ticket
 ```
 
 ### Enable hosts-based DDNS
@@ -121,7 +123,7 @@ cargo run -- --daemon --primary --domain mynode --hosts-sync --hosts-path /tmp/p
 2. Copy the `Ticket (raw)` value printed by the primary daemon at startup.
 3. Start other daemons with that ticket.
 4. Use `list` or `status` from `client` mode to inspect the network.
-5. Use `get-ticket` later only if you already have a valid ticket and want to re-save or re-share it.
+5. Use `get-ticket` later if you want to re-save or re-share the current network ticket.
 
 ### Example DDNS Flow
 
