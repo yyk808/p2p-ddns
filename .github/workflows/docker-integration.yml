@@ -6,12 +6,6 @@ on:
       - main
   pull_request:
   workflow_dispatch:
-    inputs:
-      run_full_suite:
-        description: Run the heavier docker matrix and negative-topology suites
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -70,7 +64,7 @@ jobs:
     name: Docker Matrix And Negative
     runs-on: ubuntu-24.04
     timeout-minutes: 75
-    if: github.event_name == 'workflow_dispatch' && inputs.run_full_suite
+    needs: smoke
     env:
       P2P_DDNS_IT_IMAGE_TAG: gha-full-${{ github.run_id }}-${{ github.run_attempt }}
 
