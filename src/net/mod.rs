@@ -14,10 +14,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{FutureExt, StreamExt, TryStreamExt, channel::mpsc::Receiver};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey,
-    discovery::{
-        UserData, mdns::MdnsDiscovery, pkarr::dht::DhtDiscovery, static_provider::StaticProvider,
-    },
+    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey,
+    discovery::{UserData, mdns::MdnsDiscovery, static_provider::StaticProvider},
     protocol::{Router, RouterBuilder},
 };
 use iroh_gossip::{
@@ -29,7 +27,7 @@ use rand::{Rng, distr::Alphanumeric};
 use tokio::time::{interval, timeout};
 
 use crate::{
-    cli::args::DaemonArgs,
+    cli::args::{DaemonArgs, RelayModeArg},
     domain::{
         merge,
         message::{Message, SignedMessage},
@@ -74,8 +72,9 @@ pub async fn init_network(
     args: DaemonArgs,
     storage: Storage,
 ) -> Result<(Context, GossipReceiver, Receiver<Bytes>)> {
-    // When creating a new network, un-trust all nodes and clear cache.
-    if args.primary {
+    // Explicit reset (dangerous): clears secret/topic/nodes. This is required if the user wants to
+    // intentionally create a brand-new network on an existing config directory.
+    if args.reset_storage {
         storage.clear()?;
     }
 
@@ -119,55 +118,156 @@ pub async fn init_network(
     // - Local discovery (mDNS) is enabled only in daemon mode
     // - Static discovery is always enabled (for tickets / persisted nodes)
     let sp = StaticProvider::new();
-    let mut endpoint_builder = Endpoint::builder()
-        .relay_mode(RelayMode::Disabled)
-        .secret_key(sk)
-        .discovery(sp.clone());
+    let relay_mode = if !args.relay_url.is_empty() {
+        let relay_urls: Vec<RelayUrl> = args
+            .relay_url
+            .iter()
+            .map(|s| s.parse::<RelayUrl>())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let relay_map: RelayMap = relay_urls.into_iter().collect();
+        RelayMode::Custom(relay_map)
+    } else {
+        match args.relay_mode {
+            RelayModeArg::Disabled => RelayMode::Disabled,
+            RelayModeArg::Default => RelayMode::Default,
+            RelayModeArg::Staging => RelayMode::Staging,
+        }
+    };
+    // IMPORTANT: `Endpoint::builder()` uses the `presets::N0` preset, which enables the
+    // n0.computer DNS/PKARR publisher by default (external network). This project wants to be
+    // able to run fully offline, so start from an empty builder.
+    let mut bind_v4: Option<SocketAddrV4> = None;
+    let mut bind_v6: Option<SocketAddrV6> = None;
+    let mut prefer_v6_fallback = false;
 
     if let Some(bind) = &args.bind {
         let bind: SocketAddr = bind.parse()?;
         match bind {
             SocketAddr::V4(v4) => {
-                endpoint_builder = endpoint_builder.bind_addr_v4(v4);
+                bind_v4 = Some(v4);
                 if v4.ip().is_loopback() {
-                    endpoint_builder = endpoint_builder.bind_addr_v6(SocketAddrV6::new(
-                        Ipv6Addr::LOCALHOST,
-                        v4.port(),
-                        0,
-                        0,
-                    ));
+                    bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, v4.port(), 0, 0));
+                } else if v4.ip().is_unspecified() {
+                    // Treat `0.0.0.0:PORT` as "listen on all addresses", including IPv6 when
+                    // available. This helps IPv6-only environments where users may still pass the
+                    // IPv4 wildcard out of habit.
+                    bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, v4.port(), 0, 0));
                 }
             }
             SocketAddr::V6(v6) => {
-                endpoint_builder = endpoint_builder.bind_addr_v6(v6);
+                bind_v6 = Some(v6);
+                prefer_v6_fallback = true;
                 if v6.ip().is_loopback() {
-                    endpoint_builder = endpoint_builder
-                        .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, v6.port()));
+                    bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, v6.port()));
+                } else if v6.ip().is_unspecified() {
+                    // Treat `[::]:PORT` as "listen on all addresses", including IPv4 when
+                    // available.
+                    bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, v6.port()));
                 }
             }
         }
     } else if let Ok(Some(port)) = storage.load_config::<u16>("bind_port") {
-        endpoint_builder = endpoint_builder
-            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
-            .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+        bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+        bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+        prefer_v6_fallback = true;
     } else {
         let port = rand::random::<u16>();
         storage.save_config_trival::<u16>("bind_port", port)?;
-        endpoint_builder = endpoint_builder
-            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
-            .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+        bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+        bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+        prefer_v6_fallback = true;
     }
 
-    if args.daemon && !args.no_mdns {
-        endpoint_builder = endpoint_builder.discovery(MdnsDiscovery::builder());
+    async fn bind_endpoint(
+        args: &DaemonArgs,
+        sk: &SecretKey,
+        sp: &StaticProvider,
+        relay_mode: &RelayMode,
+        bind_v4: Option<SocketAddrV4>,
+        bind_v6: Option<SocketAddrV6>,
+    ) -> Result<Endpoint> {
+        let mut builder = Endpoint::empty_builder(relay_mode.clone())
+            .secret_key(sk.clone())
+            .discovery(sp.clone());
+
+        if args.daemon && !args.no_mdns {
+            builder = builder.discovery(MdnsDiscovery::builder());
+        }
+
+        if args.dht {
+            #[cfg(feature = "pkarr-dht")]
+            {
+                use iroh::discovery::pkarr::dht::DhtDiscovery;
+                builder = builder.discovery(DhtDiscovery::builder().include_direct_addresses(true));
+            }
+            #[cfg(not(feature = "pkarr-dht"))]
+            {
+                anyhow::bail!(
+                    "`--dht` was requested, but this build was compiled without PKARR/DHT support. Rebuild with `--features pkarr-dht`."
+                );
+            }
+        }
+
+        if let Some(addr) = bind_v4 {
+            builder = builder.bind_addr_v4(addr);
+        }
+        if let Some(addr) = bind_v6 {
+            builder = builder.bind_addr_v6(addr);
+        }
+
+        Ok(builder.bind().await?)
     }
 
-    if args.dht {
-        endpoint_builder =
-            endpoint_builder.discovery(DhtDiscovery::builder().include_direct_addresses(true));
-    }
+    let endpoint = match bind_endpoint(&args, &sk, &sp, &relay_mode, bind_v4, bind_v6).await {
+        Ok(endpoint) => endpoint,
+        Err(primary_err) => {
+            if bind_v4.is_some() && bind_v6.is_some() {
+                let mut attempts = Vec::new();
 
-    let endpoint = endpoint_builder.bind().await?;
+                let first = if prefer_v6_fallback {
+                    (None, bind_v6)
+                } else {
+                    (bind_v4, None)
+                };
+                let second = if prefer_v6_fallback {
+                    (bind_v4, None)
+                } else {
+                    (None, bind_v6)
+                };
+
+                match bind_endpoint(&args, &sk, &sp, &relay_mode, first.0, first.1).await {
+                    Ok(endpoint) => {
+                        log::warn!(
+                            "Failed to bind dual-stack endpoint; falling back to single-stack. err={primary_err:#}"
+                        );
+                        endpoint
+                    }
+                    Err(e) => {
+                        attempts.push(e);
+                        match bind_endpoint(&args, &sk, &sp, &relay_mode, second.0, second.1).await
+                        {
+                            Ok(endpoint) => {
+                                log::warn!(
+                                    "Failed to bind dual-stack endpoint; falling back to single-stack. err={primary_err:#}"
+                                );
+                                endpoint
+                            }
+                            Err(e2) => {
+                                attempts.push(e2);
+                                anyhow::bail!(
+                                    "failed to bind endpoint (dual-stack): {primary_err:#}\n\
+fallback attempts: {:#?}",
+                                    attempts
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                return Err(primary_err);
+            }
+        }
+    };
     let endpoint_addr = wait_for_non_empty_addr(&endpoint).await;
 
     let (msg_sender, msg_receiver) = futures::channel::mpsc::channel(1024);
@@ -198,13 +298,23 @@ pub async fn init_network(
     me.addr = endpoint_addr;
     log::debug!("My node: {:?}", me);
 
-    // Generate a ticket for ourself.
+    // Generate/load the network ticket.
+    //
+    // Primary nodes should keep the topic/rnum stable across restarts so that existing daemons can
+    // continue to join after a reboot. Use `--reset-storage` to intentionally rotate everything.
     let ticket = if args.primary {
-        let ticket = Ticket::new(None, me.clone());
-        let (topic, rnum, _) = ticket.flatten();
-        storage.save_config_trival::<TopicId>("topic", topic)?;
-        storage.save_config::<_, Vec<u8>>("ticket_rnum", rnum)?;
-        ticket
+        let topic: Option<TopicId> = storage.load_config("topic")?;
+        let rnum: Option<Vec<u8>> = storage.load_config("ticket_rnum")?;
+        match (topic, rnum) {
+            (Some(topic), Some(rnum)) => Ticket::from_parts(topic, rnum, me.clone()),
+            _ => {
+                let ticket = Ticket::new(None, me.clone());
+                let (topic, rnum, _) = ticket.flatten();
+                storage.save_config_trival::<TopicId>("topic", topic)?;
+                storage.save_config::<_, Vec<u8>>("ticket_rnum", rnum)?;
+                ticket
+            }
+        }
     } else if let Some(ticket) = arg_ticket {
         let (topic, rnum, _) = ticket.flatten();
         storage.save_config_trival::<TopicId>("topic", topic)?;
@@ -236,14 +346,24 @@ pub async fn init_network(
         .map(|node| (node.node_id, node))
         .collect::<DashMap<EndpointId, Node>>();
 
-    // Setting up static discovery with storage
-    bootstrap_nodes.iter().for_each(|node| {
-        sp.add_endpoint_info(best_endpoint_addr_for_local(&node.addr, &me.addr));
-    });
+    // Setting up static discovery with storage.
+    //
+    // IMPORTANT: Keep all known addresses here. A ticket is not a rendezvous system; it only
+    // contains "contact info". If we collapse it to a single address and pick the wrong one
+    // (e.g. private vs public, v4 vs v6, wrong interface), joins can fail even though other
+    // addresses in the ticket would have worked.
+    bootstrap_nodes
+        .iter()
+        .filter(|node| !node.addr.is_empty())
+        .for_each(|node| {
+            sp.add_endpoint_info(node.addr.clone());
+        });
 
-    // Setting up static discovery with ticket
+    // Setting up static discovery with ticket (keep all addresses).
     if let Some(node) = invitor_node {
-        sp.set_endpoint_info(best_endpoint_addr_for_local(&node.addr, &me.addr));
+        if !node.addr.is_empty() {
+            sp.set_endpoint_info(node.addr.clone());
+        }
         bootstrap_nodes.insert(node.node_id, node);
     }
 
@@ -268,13 +388,19 @@ pub async fn init_network(
             }
 
             match timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(20),
                 gossip.subscribe_and_join(ticket.topic(), load_bootstrap(&bootstrap_nodes)),
             )
             .await
             {
                 Ok(Ok(res)) => break res.split(),
                 _ => {
+                    if retry == 1 && relay_mode == RelayMode::Disabled && args.relay_url.is_empty()
+                    {
+                        log::warn!(
+                            "Failed to join gossip; relay is disabled so this only works on LAN (mDNS) or with routable addresses in the ticket."
+                        );
+                    }
                     log::warn!("Timeout joining gossip, retrying {} times...", retry);
                     retry += 1;
                 }

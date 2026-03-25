@@ -3,12 +3,15 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::Result;
 use base64::Engine as _;
 use clap::{ArgGroup, Parser, Subcommand};
-use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing_subscriber::EnvFilter;
 
 use p2p_ddns::{
     admin::{authz::ClientRegistry, protocol::*},
-    cli::{args::DaemonArgs, output, paths},
+    cli::{
+        args::{DaemonArgs, LogLevel},
+        output, paths,
+    },
     net::init_network,
     storage, util,
 };
@@ -74,6 +77,8 @@ enum ClientCommands {
 async fn main() -> Result<()> {
     let mut args = AppArgs::parse();
 
+    init_logging(args.node.log);
+
     if args.daemon_mode {
         args.node.daemon = true;
         run_daemon(args.node).await
@@ -82,13 +87,26 @@ async fn main() -> Result<()> {
     }
 }
 
+fn init_logging(level: LogLevel) {
+    let default_filter = format!(
+        "warn,p2p_ddns={},iroh::discovery::pkarr=error,tracing::span=warn",
+        level
+    );
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
+    let _ = tracing_log::LogTracer::init();
+    log::set_max_level(log::LevelFilter::Trace);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true)
+        .with_level(true)
+        .try_init();
+}
+
 async fn run_daemon(args: DaemonArgs) -> Result<()> {
     DaemonArgs::validate(&args)?;
     DaemonArgs::apply(&args);
-
-    env_logger::Builder::new()
-        .filter_level(args.log.into())
-        .init();
 
     let db_path = paths::storage_db_path(&args);
     let storage = storage::open_or_create(db_path)?;
@@ -96,8 +114,8 @@ async fn run_daemon(args: DaemonArgs) -> Result<()> {
     let ctx = Arc::new(ctx);
     let clients = Arc::new(ClientRegistry::new());
 
-    log::debug!("Ticket: {}", ctx.ticket);
-    info!("Daemon started");
+    output::log_startup(&ctx);
+    log::info!("Daemon started");
 
     let socket_path = p2p_ddns::admin::server::default_socket_path();
     tokio::spawn({
@@ -197,7 +215,10 @@ fn get_socket_path(override_path: &Option<PathBuf>) -> PathBuf {
         env::var("RUNTIME_DIR")
             .ok()
             .map(|p| PathBuf::from(p).join("p2p-ddns.sock")),
+        // System service default when using systemd RuntimeDirectory=p2p-ddns
+        Some(PathBuf::from("/run/p2p-ddns/p2p-ddns.sock")),
         Some(PathBuf::from("/run/p2p-ddns.sock")),
+        Some(PathBuf::from("/var/run/p2p-ddns/p2p-ddns.sock")),
         Some(PathBuf::from("/var/run/p2p-ddns.sock")),
     ];
 
@@ -265,7 +286,7 @@ async fn authenticate(
                 .unwrap_or_else(|| "Unknown error".to_string())
         ))
     } else {
-        info!("Authenticated successfully");
+        log::info!("Authenticated successfully");
         Ok(pk)
     }
 }

@@ -66,6 +66,9 @@ pub fn best_endpoint_addr_for_local(remote: &EndpointAddr, local: &EndpointAddr)
     if local_ips.is_empty() {
         return remote.clone();
     }
+    let local_has_v4 = local_ips.iter().any(|ip| ip.is_ipv4());
+    let local_has_v6 = local_ips.iter().any(|ip| ip.is_ipv6());
+    let prefer_v4 = local_has_v4 || !local_has_v6;
 
     let mut best: Option<(u32, bool, SocketAddr)> = None;
     for sock in remote.ip_addrs() {
@@ -73,7 +76,12 @@ pub fn best_endpoint_addr_for_local(remote: &EndpointAddr, local: &EndpointAddr)
         let is_v4 = sock.ip().is_ipv4();
         let candidate = (score, is_v4, *sock);
         if let Some(current) = best {
-            if candidate.0 > current.0 || (candidate.0 == current.0 && candidate.1 && !current.1) {
+            let better_family = if prefer_v4 {
+                candidate.1 && !current.1
+            } else {
+                !candidate.1 && current.1
+            };
+            if candidate.0 > current.0 || (candidate.0 == current.0 && better_family) {
                 best = Some(candidate);
             }
         } else {
@@ -146,5 +154,47 @@ mod tests {
         let best = best_endpoint_addr_for_local(&remote, &local);
         let ips = best.ip_addrs().copied().collect::<Vec<_>>();
         assert_eq!(ips, vec![remote_b]);
+    }
+
+    #[test]
+    fn best_endpoint_addr_for_local_prefers_ipv6_when_local_has_no_ipv4() {
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let local: SocketAddr = "[2001:db8::1]:7777".parse().unwrap();
+        let remote_v4: SocketAddr = "192.0.2.1:7777".parse().unwrap();
+        let remote_v6: SocketAddr = "[fd00::1]:7777".parse().unwrap();
+
+        let local = EndpointAddr::from_parts(pk, [TransportAddr::Ip(local)]);
+        let remote = EndpointAddr::from_parts(
+            pk,
+            [TransportAddr::Ip(remote_v4), TransportAddr::Ip(remote_v6)],
+        );
+
+        let best = best_endpoint_addr_for_local(&remote, &local);
+        let ips = best.ip_addrs().copied().collect::<Vec<_>>();
+        assert_eq!(ips, vec![remote_v6]);
+    }
+
+    #[test]
+    fn best_endpoint_addr_for_local_prefers_ipv4_when_local_has_ipv4() {
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let local: SocketAddr = "198.51.100.10:7777".parse().unwrap();
+        let remote_v4: SocketAddr = "192.0.2.1:7777".parse().unwrap();
+        let remote_v6: SocketAddr = "[fd00::1]:7777".parse().unwrap();
+
+        let local = EndpointAddr::from_parts(pk, [TransportAddr::Ip(local)]);
+        let remote = EndpointAddr::from_parts(
+            pk,
+            [TransportAddr::Ip(remote_v4), TransportAddr::Ip(remote_v6)],
+        );
+
+        let best = best_endpoint_addr_for_local(&remote, &local);
+        let ips = best.ip_addrs().copied().collect::<Vec<_>>();
+        assert_eq!(ips, vec![remote_v4]);
     }
 }

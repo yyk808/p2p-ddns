@@ -92,14 +92,12 @@ mod test {
 
     #[tokio::test]
     async fn test_p2p_protocol() {
-        let _ = env_logger::builder().is_test(true).try_init();
         let (sender1, _) = futures::channel::mpsc::channel(1);
         let (sender2, mut msg_recv) = futures::channel::mpsc::channel(1);
         let proto1 = P2Protocol::new(sender1);
         let proto2 = P2Protocol::new(sender2);
 
-        let ep1 = Endpoint::builder()
-            .relay_mode(RelayMode::Disabled)
+        let ep1 = Endpoint::empty_builder(RelayMode::Disabled)
             .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
             .bind()
@@ -110,8 +108,7 @@ mod test {
             .accept(P2Protocol::P2P_ALPN, proto1.clone())
             .spawn();
 
-        let ep2 = Endpoint::builder()
-            .relay_mode(RelayMode::Disabled)
+        let ep2 = Endpoint::empty_builder(RelayMode::Disabled)
             .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .bind_addr_v6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
             .bind()
