@@ -59,8 +59,18 @@ pub struct DaemonArgs {
     )]
     pub log: LogLevel,
 
-    #[arg(long, short = 'B', value_name = "BIND_ADDR")]
+    /// Bind to a specific IP or socket address (for example `192.168.1.10` or `192.168.1.10:7777`).
+    #[arg(
+        long,
+        short = 'B',
+        value_name = "BIND_ADDR",
+        conflicts_with = "bind_interface"
+    )]
     pub bind: Option<String>,
+
+    /// Bind to the first IPv4/IPv6 address found on a specific network interface.
+    #[arg(long, value_name = "INTERFACE", conflicts_with = "bind")]
+    pub bind_interface: Option<String>,
 
     /// Disable local-network discovery (mDNS)
     #[arg(long, default_value_t = false)]
@@ -201,7 +211,15 @@ impl DaemonArgs {
         }
 
         if let Some(bind) = args.bind.as_deref() {
-            let _ = util::parse_bind_addr(bind)?;
+            let _ = util::parse_bind_target(bind)?;
+        }
+
+        if let Some(interface) = args.bind_interface.as_deref() {
+            let _ = util::lookup_interface_addrs(interface)?;
+        }
+
+        if args.bind.is_some() && args.bind_interface.is_some() {
+            anyhow::bail!("--bind and --bind-interface cannot be used together");
         }
 
         if let Some(bind) = args.admin_http.as_deref() {
@@ -223,5 +241,21 @@ impl DaemonArgs {
 
     pub fn apply(&self) {
         // Logger initialization moved to main() to avoid double initialization.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_bind_and_bind_interface_together() {
+        let args = DaemonArgs {
+            bind: Some("127.0.0.1".to_string()),
+            bind_interface: Some("lo".to_string()),
+            ..DaemonArgs::default()
+        };
+
+        assert!(DaemonArgs::validate(&args).is_err());
     }
 }

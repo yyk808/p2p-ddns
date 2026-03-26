@@ -40,7 +40,10 @@ use crate::{
     hosts,
     net::p2p_protocol::P2Protocol,
     storage::Storage,
-    util::{best_endpoint_addr_for_local, time_now},
+    util::{
+        BindTarget, best_endpoint_addr_for_local, lookup_interface_addrs, parse_bind_target,
+        time_now,
+    },
 };
 
 const STALE_NODE_TTL_SECS: u64 = 90;
@@ -138,10 +141,20 @@ pub async fn init_network(
     let mut bind_v6: Option<SocketAddrV6> = None;
     let mut prefer_v6_fallback = false;
 
+    let load_or_assign_bind_port = || -> Result<u16> {
+        if let Some(port) = storage.load_config::<u16>("bind_port")? {
+            Ok(port)
+        } else {
+            let port = rand::random::<u16>();
+            storage.save_config_trival::<u16>("bind_port", port)?;
+            Ok(port)
+        }
+    };
+
     if let Some(bind) = &args.bind {
-        let bind: SocketAddr = bind.parse()?;
+        let bind = parse_bind_target(bind)?;
         match bind {
-            SocketAddr::V4(v4) => {
+            BindTarget::Socket(SocketAddr::V4(v4)) => {
                 bind_v4 = Some(v4);
                 if v4.ip().is_loopback() {
                     bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, v4.port(), 0, 0));
@@ -152,7 +165,7 @@ pub async fn init_network(
                     bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, v4.port(), 0, 0));
                 }
             }
-            SocketAddr::V6(v6) => {
+            BindTarget::Socket(SocketAddr::V6(v6)) => {
                 bind_v6 = Some(v6);
                 prefer_v6_fallback = true;
                 if v6.ip().is_loopback() {
@@ -163,14 +176,38 @@ pub async fn init_network(
                     bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, v6.port()));
                 }
             }
+            BindTarget::Ip(std::net::IpAddr::V4(ip)) => {
+                let port = load_or_assign_bind_port()?;
+                bind_v4 = Some(SocketAddrV4::new(ip, port));
+                if ip.is_loopback() {
+                    bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+                } else if ip.is_unspecified() {
+                    bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+                }
+            }
+            BindTarget::Ip(std::net::IpAddr::V6(ip)) => {
+                let port = load_or_assign_bind_port()?;
+                bind_v6 = Some(SocketAddrV6::new(ip, port, 0, 0));
+                prefer_v6_fallback = true;
+                if ip.is_loopback() {
+                    bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+                } else if ip.is_unspecified() {
+                    bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+                }
+            }
         }
-    } else if let Ok(Some(port)) = storage.load_config::<u16>("bind_port") {
-        bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
-        bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
-        prefer_v6_fallback = true;
+    } else if let Some(interface) = args.bind_interface.as_deref() {
+        let port = load_or_assign_bind_port()?;
+        let addrs = lookup_interface_addrs(interface)?;
+        if let Some(ip) = addrs.v4.first().copied() {
+            bind_v4 = Some(SocketAddrV4::new(ip, port));
+        }
+        if let Some((ip, scope_id)) = addrs.v6.first().copied() {
+            bind_v6 = Some(SocketAddrV6::new(ip, port, 0, scope_id));
+        }
+        prefer_v6_fallback = bind_v4.is_none() && bind_v6.is_some();
     } else {
-        let port = rand::random::<u16>();
-        storage.save_config_trival::<u16>("bind_port", port)?;
+        let port = load_or_assign_bind_port()?;
         bind_v4 = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
         bind_v6 = Some(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
         prefer_v6_fallback = true;

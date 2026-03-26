@@ -2655,6 +2655,7 @@ dependencies = [
  "iroh",
  "iroh-gossip",
  "log",
+ "netdev",
  "parking_lot",
  "postcard",
  "rand 0.9.2",

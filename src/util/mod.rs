@@ -1,7 +1,20 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::Result;
 use iroh::{EndpointAddr, TransportAddr};
+use netdev::interface::get_interfaces;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindTarget {
+    Ip(IpAddr),
+    Socket(SocketAddr),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InterfaceAddrs {
+    pub v4: Vec<Ipv4Addr>,
+    pub v6: Vec<(Ipv6Addr, u32)>,
+}
 
 pub fn time_now() -> u64 {
     std::time::SystemTime::now()
@@ -12,6 +25,57 @@ pub fn time_now() -> u64 {
 
 pub fn parse_bind_addr(bind: &str) -> Result<SocketAddr> {
     Ok(bind.parse::<SocketAddr>()?)
+}
+
+pub fn parse_bind_target(bind: &str) -> Result<BindTarget> {
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        return Ok(BindTarget::Socket(addr));
+    }
+    if let Ok(ip) = bind.parse::<IpAddr>() {
+        return Ok(BindTarget::Ip(ip));
+    }
+    if bind.starts_with('[') && bind.ends_with(']') {
+        let inner = &bind[1..bind.len() - 1];
+        if let Ok(ip) = inner.parse::<IpAddr>() {
+            return Ok(BindTarget::Ip(ip));
+        }
+    }
+    anyhow::bail!("invalid bind value `{bind}`; expected IP or IP:PORT");
+}
+
+pub fn lookup_interface_addrs(name: &str) -> Result<InterfaceAddrs> {
+    let iface = get_interfaces()
+        .into_iter()
+        .find(|iface| iface.name == name || iface.friendly_name.as_deref() == Some(name))
+        .ok_or_else(|| anyhow::anyhow!("network interface `{name}` not found"))?;
+
+    let mut addrs = InterfaceAddrs {
+        v4: iface.ipv4.iter().map(|net| net.addr()).collect(),
+        v6: iface
+            .ipv6
+            .iter()
+            .enumerate()
+            .map(|(idx, net)| {
+                let scope_id = iface
+                    .ipv6_scope_ids
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(iface.index);
+                (net.addr(), scope_id)
+            })
+            .collect(),
+    };
+
+    addrs.v4.sort_unstable();
+    addrs.v4.dedup();
+    addrs.v6.sort_unstable();
+    addrs.v6.dedup();
+
+    if addrs.v4.is_empty() && addrs.v6.is_empty() {
+        anyhow::bail!("network interface `{name}` has no IP addresses");
+    }
+
+    Ok(addrs)
 }
 
 pub fn best_ip_for_display(addr: &EndpointAddr) -> Option<IpAddr> {
@@ -108,6 +172,27 @@ mod tests {
     fn parse_bind_addr_accepts_ipv4_and_ipv6() -> Result<()> {
         parse_bind_addr("127.0.0.1:1234")?;
         parse_bind_addr("[::1]:1234")?;
+        Ok(())
+    }
+
+    #[test]
+    fn parse_bind_target_accepts_ip_and_socket() -> Result<()> {
+        assert_eq!(
+            parse_bind_target("127.0.0.1")?,
+            BindTarget::Ip("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_bind_target("127.0.0.1:1234")?,
+            BindTarget::Socket("127.0.0.1:1234".parse().unwrap())
+        );
+        assert_eq!(
+            parse_bind_target("[::1]")?,
+            BindTarget::Ip("::1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_bind_target("[::1]:1234")?,
+            BindTarget::Socket("[::1]:1234".parse().unwrap())
+        );
         Ok(())
     }
 
