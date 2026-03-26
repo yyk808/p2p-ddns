@@ -76,6 +76,34 @@ to join other daemons.
 cargo run --bin p2p-ddns -- --ticket <TICKET_STRING> --domain mynode
 ```
 
+### Bind to a specific IP or interface
+
+Bind to a specific IP while reusing the daemon's persisted port:
+
+```bash
+cargo run --bin p2p-ddns -- --primary --domain mynode --bind 192.168.1.10
+```
+
+Bind to a specific IP and port:
+
+```bash
+cargo run --bin p2p-ddns -- --primary --domain mynode --bind 192.168.1.10:7777
+```
+
+Bind using the first IPv4/IPv6 address found on a named network interface:
+
+```bash
+cargo run --bin p2p-ddns -- --primary --domain mynode --bind-interface eth0
+```
+
+Notes:
+
+- `--bind` accepts either `IP` or `IP:PORT`
+- `--bind-interface` selects addresses from a named interface and reuses the persisted bind port
+- `--bind` and `--bind-interface` are mutually exclusive
+- If no bind port has been persisted yet, one is generated and stored automatically
+- Interface matching accepts the OS interface name, and on Windows also accepts the friendly name
+
 ### Query a running daemon from the local machine
 
 `client` mode talks to the local daemon over a Unix socket and does not require a ticket by
@@ -110,7 +138,8 @@ cargo run --bin p2p-ddns -- --primary --domain mynode --hosts-sync --hosts-path 
 
 ### Useful daemon options
 
-- `--bind <ADDR>`: bind the P2P endpoint to a specific address
+- `--bind <ADDR>`: bind the P2P endpoint to a specific IP or `IP:PORT`
+- `--bind-interface <INTERFACE>`: bind using the first IPv4/IPv6 address found on a named interface
 - `--config <DIR>`: set the storage directory
 - `--no-mdns`: disable local-network discovery
 - `--dht`: enable PKARR/DHT discovery when built with `--features pkarr-dht`
@@ -163,6 +192,9 @@ The common deployment path is:
 5. Optionally enable hosts sync with:
    `P2P_DDNS_HOSTS_SYNC=1`
    `P2P_DDNS_HOSTS_SUFFIX=p2p`
+   For bind-related settings:
+   `P2P_DDNS_BIND_ADDRESS=192.168.1.10`
+   or `P2P_DDNS_EXTRA_ARGS="--bind-interface eth0"`
 6. Start the service with `systemctl enable --now p2p-ddns`.
 
 ## Testing

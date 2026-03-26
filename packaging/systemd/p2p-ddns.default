@@ -21,7 +21,10 @@ P2P_DDNS_ROLE=primary
 
 # Optional per-node settings:
 # P2P_DDNS_DOMAIN=node-1
-# P2P_DDNS_BIND_ADDRESS=0.0.0.0:7777
+# P2P_DDNS_BIND_ADDRESS=192.168.1.10
+# P2P_DDNS_BIND_ADDRESS=192.168.1.10:7777
+# To bind by interface name instead, use:
+# P2P_DDNS_EXTRA_ARGS=--bind-interface eth0
 # P2P_DDNS_LOG_LEVEL=info
 # P2P_DDNS_NO_MDNS=0
 # P2P_DDNS_DHT=0
