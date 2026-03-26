@@ -41,8 +41,8 @@ use crate::{
     net::p2p_protocol::P2Protocol,
     storage::Storage,
     util::{
-        BindTarget, best_endpoint_addr_for_local, lookup_interface_addrs, parse_bind_target,
-        time_now,
+        BindTarget, best_endpoint_addr_for_local, filter_advertisable_endpoint_addr,
+        lookup_interface_addrs, parse_bind_target, time_now,
     },
 };
 
@@ -67,6 +67,23 @@ pub struct Context {
     join_announced: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     hosts_sync: Arc<RwLock<HostsSyncStatus>>,
+}
+
+fn should_filter_advertised_addrs(args: &DaemonArgs) -> bool {
+    args.bind.is_none() && args.bind_interface.is_none()
+}
+
+fn advertised_endpoint_addr(addr: &EndpointAddr, args: &DaemonArgs) -> EndpointAddr {
+    if !should_filter_advertised_addrs(args) {
+        return addr.clone();
+    }
+
+    let filtered = filter_advertisable_endpoint_addr(addr);
+    if filtered.ip_addrs().next().is_some() || filtered.relay_urls().next().is_some() {
+        filtered
+    } else {
+        addr.clone()
+    }
 }
 
 pub async fn init_network(
@@ -304,6 +321,7 @@ fallback attempts: {:#?}",
         }
     };
     let endpoint_addr = wait_for_non_empty_addr(&endpoint).await;
+    let advertised_addr = advertised_endpoint_addr(&endpoint_addr, &args);
 
     let (msg_sender, msg_receiver) = futures::channel::mpsc::channel(1024);
     let mut membership = HyparviewConfig::default();
@@ -330,7 +348,7 @@ fallback attempts: {:#?}",
         last_heartbeat: time_now(),
     };
     // Prefer the endpoint's current view of our reachable addresses.
-    me.addr = endpoint_addr;
+    me.addr = advertised_addr;
     log::debug!("My node: {:?}", me);
 
     // Generate/load the network ticket.
@@ -525,7 +543,7 @@ impl Context {
             .nodes
             .iter()
             .map(|entry| entry.value().clone())
-            .chain([self.me.as_ref().clone()])
+            .chain([self.current_node_state()])
             .collect::<Vec<_>>();
 
         match hosts::sync_nodes_to_hosts(
@@ -593,13 +611,14 @@ impl Context {
             return;
         }
 
+        let me = self.current_node_state();
         let invited = Message::Invited {
             topic: self.ticket.topic(),
             rnum: self.ticket.rnum(),
-            addr: self.handle.addr(),
-            alias: self.me.domain.clone(),
-            services: self.me.services.clone(),
-            invitor: self.me.invitor,
+            addr: me.addr,
+            alias: me.domain,
+            services: me.services,
+            invitor: me.invitor,
         };
 
         if let Err(e) = self.broadcast_message(invited).await {
@@ -824,7 +843,7 @@ impl Context {
 
     fn current_node_state(&self) -> Node {
         let mut me = (*self.me).clone();
-        me.addr = self.handle.addr();
+        me.addr = advertised_endpoint_addr(&self.handle.addr(), &self.args);
         me.last_heartbeat = time_now();
         me
     }
@@ -987,7 +1006,7 @@ impl Context {
                         .nodes
                         .iter()
                         .map(|t| t.value().clone())
-                        .chain([self.me.as_ref().clone()])
+                        .chain([self.current_node_state()])
                         .collect::<Vec<_>>();
 
                     let message = Message::SyncResponse { nodes };
@@ -1046,7 +1065,7 @@ impl Context {
         }
 
         log::debug!("Sending message to {:?}: {:?}", id, message);
-        let local = self.handle.addr();
+        let local = advertised_endpoint_addr(&self.handle.addr(), &self.args);
         let target = self
             .nodes
             .get(id)
