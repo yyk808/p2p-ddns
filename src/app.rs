@@ -219,6 +219,11 @@ fn get_socket_path(override_path: &Option<PathBuf>) -> PathBuf {
         return PathBuf::from(path);
     }
 
+    let default_path = crate::admin::server::default_socket_path();
+    if default_path.exists() {
+        return default_path;
+    }
+
     let candidates = vec![
         env::var("XDG_RUNTIME_DIR")
             .ok()
@@ -240,10 +245,7 @@ fn get_socket_path(override_path: &Option<PathBuf>) -> PathBuf {
         }
     }
 
-    env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .map(|p| PathBuf::from(p).join("p2p-ddns.sock"))
-        .unwrap_or_else(|| PathBuf::from("/run/p2p-ddns.sock"))
+    default_path
 }
 
 async fn connect_to_daemon(

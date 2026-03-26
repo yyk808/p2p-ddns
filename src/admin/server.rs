@@ -1,7 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{io::ErrorKind, path::Path, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::net::UnixListener;
 
 use crate::{
@@ -14,6 +14,9 @@ use crate::{
 };
 
 pub fn default_socket_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("P2P_DDNS_SOCKET") {
+        return PathBuf::from(path);
+    }
     if let Some(xdg_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(xdg_runtime).join("p2p-ddns.sock");
     } else if let Some(runtime_dir) = std::env::var_os("RUNTIME_DIR") {
@@ -32,13 +35,21 @@ pub async fn run_management_server(
     }
 
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log_socket_setup_failure(
+                "create management socket directory",
+                parent,
+                &socket_path,
+                &e,
+            );
+            return;
+        }
     }
 
     let listener = match UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
-            error!("Failed to bind management socket: {}", e);
+            log_socket_setup_failure("bind management socket", &socket_path, &socket_path, &e);
             return;
         }
     };
@@ -68,6 +79,23 @@ pub async fn run_management_server(
                 error!("Failed to accept connection: {}", e);
             }
         }
+    }
+}
+
+fn log_socket_setup_failure(
+    action: &str,
+    target: &Path,
+    socket_path: &Path,
+    error: &std::io::Error,
+) {
+    if error.kind() == ErrorKind::PermissionDenied {
+        warn!(
+            "Could not {action} at {}: {error}. The daemon does not have permission to create the admin socket at {}. Re-run with sudo or set P2P_DDNS_SOCKET/XDG_RUNTIME_DIR/RUNTIME_DIR to a writable location.",
+            target.display(),
+            socket_path.display()
+        );
+    } else {
+        error!("Failed to {action} at {}: {}", target.display(), error);
     }
 }
 
