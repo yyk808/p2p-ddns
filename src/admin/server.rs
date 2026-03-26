@@ -1,4 +1,8 @@
-use std::{io::ErrorKind, path::Path, path::PathBuf, sync::Arc};
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use log::{error, info, warn};
@@ -14,15 +18,61 @@ use crate::{
 };
 
 pub fn default_socket_path() -> PathBuf {
+    socket_path_candidates()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| std::env::temp_dir().join("p2p-ddns").join("p2p-ddns.sock"))
+}
+
+pub fn socket_path_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    let push_candidate = |candidates: &mut Vec<PathBuf>, path: PathBuf| {
+        if !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    };
+
     if let Some(path) = std::env::var_os("P2P_DDNS_SOCKET") {
-        return PathBuf::from(path);
+        push_candidate(&mut candidates, PathBuf::from(path));
+        return candidates;
     }
     if let Some(xdg_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(xdg_runtime).join("p2p-ddns.sock");
-    } else if let Some(runtime_dir) = std::env::var_os("RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("p2p-ddns.sock");
+        push_candidate(
+            &mut candidates,
+            PathBuf::from(xdg_runtime).join("p2p-ddns.sock"),
+        );
     }
-    PathBuf::from("/run/p2p-ddns.sock")
+    if let Some(runtime_dir) = std::env::var_os("RUNTIME_DIR") {
+        push_candidate(
+            &mut candidates,
+            PathBuf::from(runtime_dir).join("p2p-ddns.sock"),
+        );
+    }
+
+    push_candidate(&mut candidates, PathBuf::from("/run/p2p-ddns.sock"));
+
+    if let Some(runtime_dir) = dirs::runtime_dir() {
+        push_candidate(&mut candidates, runtime_dir.join("p2p-ddns.sock"));
+    }
+
+    if let Some(cache_dir) = dirs::cache_dir() {
+        push_candidate(
+            &mut candidates,
+            cache_dir.join("p2p-ddns").join("p2p-ddns.sock"),
+        );
+    }
+
+    push_candidate(
+        &mut candidates,
+        std::env::temp_dir().join("p2p-ddns").join("p2p-ddns.sock"),
+    );
+
+    candidates
+}
+
+pub async fn run_default_management_server(ctx: Arc<Context>, clients: Arc<ClientRegistry>) {
+    run_management_server_with_candidates(socket_path_candidates(), ctx, clients).await;
 }
 
 pub async fn run_management_server(
@@ -30,42 +80,75 @@ pub async fn run_management_server(
     ctx: Arc<Context>,
     clients: Arc<ClientRegistry>,
 ) {
+    run_management_server_with_candidates(vec![socket_path], ctx, clients).await;
+}
+
+async fn run_management_server_with_candidates(
+    candidates: Vec<PathBuf>,
+    ctx: Arc<Context>,
+    clients: Arc<ClientRegistry>,
+) {
+    let total_candidates = candidates.len();
+
+    for (index, socket_path) in candidates.into_iter().enumerate() {
+        match try_bind_management_socket(&socket_path) {
+            Ok(listener) => {
+                info!("Management socket listening on: {}", socket_path.display());
+                accept_loop(listener, ctx, clients).await;
+                return;
+            }
+            Err(SocketSetupError {
+                action,
+                target,
+                socket_path,
+                error,
+            }) => {
+                let will_retry = index + 1 < total_candidates;
+                log_socket_setup_failure(&action, &target, &socket_path, &error, will_retry);
+            }
+        }
+    }
+
+    error!("Failed to initialize the admin socket on any candidate path");
+}
+
+fn try_bind_management_socket(socket_path: &Path) -> Result<UnixListener, SocketSetupError> {
     if socket_path.exists() {
-        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_file(socket_path).ok();
     }
 
-    if let Some(parent) = socket_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log_socket_setup_failure(
-                "create management socket directory",
-                parent,
-                &socket_path,
-                &e,
-            );
-            return;
-        }
+    if let Some(parent) = socket_path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return Err(SocketSetupError {
+            action: "create management socket directory".to_string(),
+            target: parent.to_path_buf(),
+            socket_path: socket_path.to_path_buf(),
+            error,
+        });
     }
 
-    let listener = match UnixListener::bind(&socket_path) {
-        Ok(l) => l,
-        Err(e) => {
-            log_socket_setup_failure("bind management socket", &socket_path, &socket_path, &e);
-            return;
-        }
-    };
+    let listener = UnixListener::bind(socket_path).map_err(|error| SocketSetupError {
+        action: "bind management socket".to_string(),
+        target: socket_path.to_path_buf(),
+        socket_path: socket_path.to_path_buf(),
+        error,
+    })?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&socket_path) {
+        if let Ok(meta) = std::fs::metadata(socket_path) {
             let mut perms = meta.permissions();
             perms.set_mode(0o660);
-            let _ = std::fs::set_permissions(&socket_path, perms);
+            let _ = std::fs::set_permissions(socket_path, perms);
         }
     }
 
-    info!("Management socket listening on: {}", socket_path.display());
+    Ok(listener)
+}
 
+async fn accept_loop(listener: UnixListener, ctx: Arc<Context>, clients: Arc<ClientRegistry>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -87,16 +170,42 @@ fn log_socket_setup_failure(
     target: &Path,
     socket_path: &Path,
     error: &std::io::Error,
+    will_retry: bool,
 ) {
-    if error.kind() == ErrorKind::PermissionDenied {
+    if matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+    ) {
         warn!(
-            "Could not {action} at {}: {error}. The daemon does not have permission to create the admin socket at {}. Re-run with sudo or set P2P_DDNS_SOCKET/XDG_RUNTIME_DIR/RUNTIME_DIR to a writable location.",
+            "Could not {action} at {}: {error}. The daemon cannot create the admin socket at {}.{}",
             target.display(),
-            socket_path.display()
+            socket_path.display(),
+            if will_retry {
+                " Trying the next socket path candidate."
+            } else {
+                " Re-run with sudo or set P2P_DDNS_SOCKET/XDG_RUNTIME_DIR/RUNTIME_DIR to a writable location."
+            }
         );
     } else {
-        error!("Failed to {action} at {}: {}", target.display(), error);
+        error!(
+            "Failed to {action} at {} for admin socket {}: {}{}",
+            target.display(),
+            socket_path.display(),
+            error,
+            if will_retry {
+                "; trying the next socket path candidate"
+            } else {
+                ""
+            }
+        );
     }
+}
+
+struct SocketSetupError {
+    action: String,
+    target: PathBuf,
+    socket_path: PathBuf,
+    error: std::io::Error,
 }
 
 async fn handle_client_connection(

@@ -113,12 +113,11 @@ pub async fn run_daemon(mut args: DaemonArgs) -> Result<()> {
         sync_hosts_file(&ctx)?;
     }
 
-    let socket_path = crate::admin::server::default_socket_path();
     tokio::spawn({
         let ctx = ctx.clone();
         let clients = clients.clone();
         async move {
-            crate::admin::server::run_management_server(socket_path, ctx, clients).await;
+            crate::admin::server::run_default_management_server(ctx, clients).await;
         }
     });
 
@@ -219,33 +218,27 @@ fn get_socket_path(override_path: &Option<PathBuf>) -> PathBuf {
         return PathBuf::from(path);
     }
 
-    let default_path = crate::admin::server::default_socket_path();
-    if default_path.exists() {
-        return default_path;
-    }
-
-    let candidates = vec![
-        env::var("XDG_RUNTIME_DIR")
-            .ok()
-            .map(|p| PathBuf::from(p).join("p2p-ddns.sock")),
-        env::var("RUNTIME_DIR")
-            .ok()
-            .map(|p| PathBuf::from(p).join("p2p-ddns.sock")),
-        Some(PathBuf::from("/run/p2p-ddns/p2p-ddns.sock")),
-        Some(PathBuf::from("/run/p2p-ddns.sock")),
-        Some(PathBuf::from("/var/run/p2p-ddns/p2p-ddns.sock")),
-        Some(PathBuf::from("/var/run/p2p-ddns.sock")),
-    ];
-
-    for candidate in candidates {
-        if let Some(path) = candidate
-            && path.exists()
-        {
-            return path;
+    let mut candidates = crate::admin::server::socket_path_candidates();
+    for legacy_path in [
+        PathBuf::from("/run/p2p-ddns/p2p-ddns.sock"),
+        PathBuf::from("/var/run/p2p-ddns/p2p-ddns.sock"),
+        PathBuf::from("/var/run/p2p-ddns.sock"),
+    ] {
+        if !candidates.iter().any(|path| path == &legacy_path) {
+            candidates.push(legacy_path);
         }
     }
 
-    default_path
+    for path in &candidates {
+        if path.exists() {
+            return path.clone();
+        }
+    }
+
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(crate::admin::server::default_socket_path)
 }
 
 async fn connect_to_daemon(
@@ -298,7 +291,6 @@ async fn authenticate(
                 .unwrap_or_else(|| "Unknown error".to_string())
         ))
     } else {
-        log::info!("Authenticated successfully");
         Ok(pk)
     }
 }
@@ -322,14 +314,12 @@ async fn execute_command(
     let response: ClientResponse = read_message(stream).await?;
 
     match response {
-        ClientResponse::Nodes(nodes) => display_nodes(&nodes),
-        ClientResponse::Status(status) => display_status(&status),
+        ClientResponse::Nodes(nodes) => output::display_nodes(&nodes),
+        ClientResponse::Status(status) => output::display_status(&status),
         ClientResponse::Ticket(ticket) => {
-            println!("Current P2P Ticket: {}", ticket);
+            output::display_ticket(&ticket);
             let ticket_path = get_client_config_path().join("ticket.txt");
-            if let Err(e) = std::fs::write(&ticket_path, &ticket) {
-                log::warn!("Failed to save ticket: {}", e);
-            } else {
+            if std::fs::write(&ticket_path, &ticket).is_ok() {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -339,10 +329,9 @@ async fn execute_command(
                         let _ = std::fs::set_permissions(&ticket_path, perms);
                     }
                 }
-                log::info!("Ticket saved to {}", ticket_path.display());
             }
         }
-        ClientResponse::Ack => println!("Command executed successfully"),
+        ClientResponse::Ack => output::display_ack("Command executed successfully"),
         ClientResponse::Error(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -364,64 +353,6 @@ fn get_client_config_path() -> PathBuf {
     dirs::config_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("p2p-ddns")
-}
-
-fn display_nodes(nodes: &[crate::domain::node::Node]) {
-    let now = util::time_now();
-    let data = nodes
-        .iter()
-        .map(|node| {
-            let addr = util::best_ip_for_display(&node.addr)
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
-            let alias = node.domain.clone();
-            let last_seen = format_duration(now.saturating_sub(node.last_heartbeat));
-            (addr, alias, last_seen)
-        })
-        .collect::<Vec<_>>();
-
-    let mut builder = tabled::builder::Builder::default();
-    builder.push_record(["Address", "Name", "Last Seen"]);
-    for (addr, alias, last_seen) in data {
-        builder.push_record([addr, alias, last_seen]);
-    }
-    let table = builder.build();
-    println!("{}", table);
-}
-
-fn display_status(status: &crate::domain::client::DaemonStatus) {
-    println!("=== Daemon Status ===");
-    println!("Running: {}", status.running);
-    println!("Paused: {}", status.paused);
-    println!("Node Count: {}", status.node_count);
-    println!("Client Count: {}", status.client_count);
-    println!("Uptime: {}s", status.uptime_seconds);
-    println!("My Domain: {}", status.my_domain);
-    println!("My Address: {}", status.my_addr);
-    println!("Hosts Sync Enabled: {}", status.hosts_sync.enabled);
-    if let Some(path) = &status.hosts_sync.path {
-        println!("Hosts Sync Path: {}", path);
-    }
-    println!(
-        "Hosts Cleanup On Shutdown: {}",
-        status.hosts_sync.cleanup_on_shutdown
-    );
-    if let Some(ts) = status.hosts_sync.last_success {
-        println!("Hosts Sync Last Success: {}", ts);
-    }
-    if let Some(ts) = status.hosts_sync.last_cleanup {
-        println!("Hosts Sync Last Cleanup: {}", ts);
-    }
-    if let Some(err) = &status.hosts_sync.last_error {
-        println!("Hosts Sync Last Error: {}", err);
-    }
-}
-
-fn format_duration(seconds: u64) -> String {
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let seconds = seconds % 60;
-    format!("{}Hour {}Min {}Sec ago", hours, minutes, seconds)
 }
 
 async fn send_message<T: serde::Serialize>(
