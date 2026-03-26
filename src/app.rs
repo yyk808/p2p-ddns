@@ -46,6 +46,10 @@ pub struct ClientArgs {
     )]
     pub log: LogLevel,
 
+    /// Output results as JSON (useful for scripting and piping)
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: ClientCommandArgs,
 }
@@ -58,23 +62,38 @@ pub enum ClientCommandArgs {
     /// Get daemon status
     Status,
 
-    /// Add a node using ticket
-    AddNode { ticket: String },
-
-    /// Remove a node by ID
-    RemoveNode { id: String },
+    /// Manage nodes
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
 
     /// Get current P2P ticket from daemon
-    GetTicket,
+    Ticket,
 
-    /// Pause daemon (future)
+    /// Pause daemon
     Pause,
 
-    /// Resume daemon (future)
+    /// Resume daemon
     Resume,
 
     /// Gracefully shutdown daemon
     Stop,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum NodeCommand {
+    /// Add a node using a ticket
+    Add {
+        /// The ticket string from the other node
+        ticket: String,
+    },
+
+    /// Remove a node by ID (supports prefix matching)
+    Remove {
+        /// Full or prefix of the node ID to remove
+        id: String,
+    },
 }
 
 pub fn init_logging(level: LogLevel) {
@@ -145,7 +164,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
     let mut stream = connect_to_daemon(&socket_path, args.timeout).await?;
     let ticket = args.ticket.clone().or_else(|| get_ticket().ok());
     let _client_pk = authenticate(&mut stream, ticket.as_deref()).await?;
-    execute_command(&mut stream, args.command).await?;
+    execute_command(&mut stream, args.command, args.json).await?;
     Ok(())
 }
 
@@ -251,7 +270,8 @@ async fn connect_to_daemon(
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Failed to connect to daemon at {} (timeout: {}s). Is daemon running?",
+                    "Failed to connect to daemon at {} (timeout: {}s).\n\
+                     Is the daemon running? Try: sudo systemctl start p2p-ddns",
                     socket_path.display(),
                     timeout_sec
                 )
@@ -298,13 +318,18 @@ async fn authenticate(
 async fn execute_command(
     stream: &mut tokio::net::UnixStream,
     command: ClientCommandArgs,
+    json: bool,
 ) -> Result<()> {
     let cmd = match command {
         ClientCommandArgs::List => ClientCommand::Query,
         ClientCommandArgs::Status => ClientCommand::Status,
-        ClientCommandArgs::AddNode { ticket } => ClientCommand::AddNode { ticket },
-        ClientCommandArgs::RemoveNode { id } => ClientCommand::RemoveNode { id },
-        ClientCommandArgs::GetTicket => ClientCommand::GetTicket,
+        ClientCommandArgs::Node {
+            command: NodeCommand::Add { ticket },
+        } => ClientCommand::AddNode { ticket },
+        ClientCommandArgs::Node {
+            command: NodeCommand::Remove { id },
+        } => ClientCommand::RemoveNode { id },
+        ClientCommandArgs::Ticket => ClientCommand::GetTicket,
         ClientCommandArgs::Pause => ClientCommand::Pause,
         ClientCommandArgs::Resume => ClientCommand::Resume,
         ClientCommandArgs::Stop => ClientCommand::Shutdown,
@@ -314,10 +339,26 @@ async fn execute_command(
     let response: ClientResponse = read_message(stream).await?;
 
     match response {
-        ClientResponse::Nodes(nodes) => output::display_nodes(&nodes),
-        ClientResponse::Status(status) => output::display_status(&status),
+        ClientResponse::Nodes(nodes) => {
+            if json {
+                output::display_nodes_json(&nodes);
+            } else {
+                output::display_nodes(&nodes);
+            }
+        }
+        ClientResponse::Status(status) => {
+            if json {
+                output::display_status_json(&status);
+            } else {
+                output::display_status(&status);
+            }
+        }
         ClientResponse::Ticket(ticket) => {
-            output::display_ticket(&ticket);
+            if json {
+                output::display_ticket_json(&ticket);
+            } else {
+                output::display_ticket(&ticket);
+            }
             let ticket_path = get_client_config_path().join("ticket.txt");
             if std::fs::write(&ticket_path, &ticket).is_ok() {
                 #[cfg(unix)]
@@ -329,11 +370,27 @@ async fn execute_command(
                         let _ = std::fs::set_permissions(&ticket_path, perms);
                     }
                 }
+                if !json {
+                    output::display_info(&format!(
+                        "Ticket saved to {}",
+                        ticket_path.display()
+                    ));
+                }
             }
         }
-        ClientResponse::Ack => output::display_ack("Command executed successfully"),
+        ClientResponse::Ack(message) => {
+            if json {
+                output::display_ack_json(&message);
+            } else {
+                output::display_ack(&message);
+            }
+        }
         ClientResponse::Error(e) => {
-            eprintln!("Error: {}", e);
+            if json {
+                output::display_error_json(&e);
+            } else {
+                output::display_error(&e);
+            }
             std::process::exit(1);
         }
     }

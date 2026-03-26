@@ -7,6 +7,7 @@ use comfy_table::{
 };
 use crossterm::terminal;
 use iroh::EndpointAddr;
+use serde_json::json;
 
 use crate::{
     domain::{
@@ -18,11 +19,33 @@ use crate::{
 };
 
 fn format_duration(seconds: u64) -> String {
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let seconds = seconds % 60;
-
-    format!("{}Hour {}Min {}Sec ago", hours, minutes, seconds)
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 3600 {
+        let m = seconds / 60;
+        let s = seconds % 60;
+        if s == 0 {
+            format!("{}m", m)
+        } else {
+            format!("{}m {}s", m, s)
+        }
+    } else if seconds < 86400 {
+        let h = seconds / 3600;
+        let m = (seconds % 3600) / 60;
+        if m == 0 {
+            format!("{}h", h)
+        } else {
+            format!("{}h {}m", h, m)
+        }
+    } else {
+        let d = seconds / 86400;
+        let h = (seconds % 86400) / 3600;
+        if h == 0 {
+            format!("{}d", d)
+        } else {
+            format!("{}d {}h", d, h)
+        }
+    }
 }
 
 pub fn print(ctx: &Context) {
@@ -40,7 +63,7 @@ pub fn print(ctx: &Context) {
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
             let alias = node.domain.clone();
-            let last_seen = format_duration(now.saturating_sub(node.last_heartbeat));
+            let last_seen = format!("{} ago", format_duration(now.saturating_sub(node.last_heartbeat)));
             (addr, alias, last_seen)
         })
         .collect::<Vec<_>>();
@@ -103,7 +126,7 @@ fn last_seen_cell(seconds: u64) -> Cell {
     } else {
         Color::Red
     };
-    styled_cell(format_duration(seconds), Some(color), false)
+    styled_cell(format!("{} ago", format_duration(seconds)), Some(color), false)
 }
 
 fn terminal_width() -> Option<usize> {
@@ -208,6 +231,22 @@ fn print_status_sections(left: Vec<(usize, String)>, right: Vec<(usize, String)>
 }
 
 pub fn display_nodes(nodes: &[Node]) {
+    if nodes.is_empty() {
+        println!(
+            "\n{}",
+            colorize("No nodes found in the network.", Some(Color::DarkGrey), false)
+        );
+        println!(
+            "{}",
+            colorize(
+                "Use 'p2p-ddnsctl node add <ticket>' to add a node.",
+                Some(Color::DarkGrey),
+                false
+            )
+        );
+        return;
+    }
+
     let now = util::time_now();
     let mut rows = nodes
         .iter()
@@ -423,11 +462,78 @@ pub fn display_ticket(ticket: &str) {
 }
 
 pub fn display_ack(message: &str) {
-    if stdout_supports_color() {
-        println!("\n\x1b[32m{}\x1b[0m", message);
+    println!("\n{}", colorize(message, Some(Color::Green), true));
+}
+
+pub fn display_info(message: &str) {
+    println!("{}", colorize(message, Some(Color::DarkGrey), false));
+}
+
+pub fn display_error(message: &str) {
+    eprintln!("\n{}", colorize(format!("Error: {}", message), Some(Color::Red), true));
+}
+
+// --- JSON output functions ---
+
+fn node_to_json(node: &Node) -> serde_json::Value {
+    let addr = util::best_ip_for_display(&node.addr)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let role = if node.services.contains_key(SERVICE_MARKER_CLIENT) {
+        "Client"
     } else {
-        println!("\n{}", message);
-    }
+        "Daemon"
+    };
+    json!({
+        "node_id": node.node_id.to_string(),
+        "domain": node.domain,
+        "address": addr,
+        "role": role,
+        "services": node.services,
+        "last_heartbeat": node.last_heartbeat,
+    })
+}
+
+pub fn display_nodes_json(nodes: &[Node]) {
+    let nodes_json: Vec<serde_json::Value> = nodes.iter().map(node_to_json).collect();
+    let output = json!({ "nodes": nodes_json, "count": nodes.len() });
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+pub fn display_status_json(status: &DaemonStatus) {
+    let output = json!({
+        "running": status.running,
+        "paused": status.paused,
+        "node_count": status.node_count,
+        "client_count": status.client_count,
+        "uptime_seconds": status.uptime_seconds,
+        "my_domain": status.my_domain,
+        "my_addr": status.my_addr,
+        "hosts_sync": {
+            "enabled": status.hosts_sync.enabled,
+            "path": status.hosts_sync.path,
+            "cleanup_on_shutdown": status.hosts_sync.cleanup_on_shutdown,
+            "last_success": status.hosts_sync.last_success,
+            "last_cleanup": status.hosts_sync.last_cleanup,
+            "last_error": status.hosts_sync.last_error,
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+pub fn display_ticket_json(ticket: &str) {
+    let output = json!({ "ticket": ticket });
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+pub fn display_ack_json(message: &str) {
+    let output = json!({ "ok": true, "message": message });
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+pub fn display_error_json(error: &str) {
+    let output = json!({ "ok": false, "error": error });
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
 }
 
 fn format_endpoint_addr(addr: &EndpointAddr) -> String {

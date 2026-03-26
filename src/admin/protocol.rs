@@ -36,7 +36,7 @@ pub enum ClientResponse {
     Nodes(Vec<Node>),
     Status(DaemonStatus),
     Ticket(String),
-    Ack,
+    Ack(String),
     Error(String),
 }
 

@@ -173,7 +173,7 @@ async fn add_node_and_remove_node_persist_and_update_state() -> Result<()> {
 
     let ticket = Ticket::new(Some(ctx.ticket.topic()), node).to_string();
     let outcome = handler::handle_command(&ClientCommand::AddNode { ticket }, &ctx, &clients).await;
-    assert!(matches!(outcome.response, ClientResponse::Ack));
+    assert!(matches!(outcome.response, ClientResponse::Ack(_)));
     assert!(ctx.nodes.contains_key(&pk));
 
     let outcome = handler::handle_command(
@@ -182,7 +182,7 @@ async fn add_node_and_remove_node_persist_and_update_state() -> Result<()> {
         &clients,
     )
     .await;
-    assert!(matches!(outcome.response, ClientResponse::Ack));
+    assert!(matches!(outcome.response, ClientResponse::Ack(_)));
     assert!(!ctx.nodes.contains_key(&pk));
 
     Ok(())

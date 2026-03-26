@@ -177,6 +177,7 @@ pub async fn handle_command(
                 };
             }
 
+            let domain = node.domain.clone();
             ctx.static_provider.add_endpoint_info(node.addr.clone());
             ctx.nodes.insert(node.node_id, node.clone());
             if let Err(e) = ctx.storage.save_node(&node) {
@@ -187,18 +188,45 @@ pub async fn handle_command(
             }
 
             CommandOutcome {
-                response: ClientResponse::Ack,
+                response: ClientResponse::Ack(format!("Node added: {}", domain)),
                 action: None,
             }
         }
         ClientCommand::RemoveNode { id } => {
             let node_id: EndpointId = match id.parse() {
                 Ok(id) => id,
-                Err(e) => {
-                    return CommandOutcome {
-                        response: ClientResponse::Error(format!("Invalid node id: {e}")),
-                        action: None,
-                    };
+                Err(_) => {
+                    // Prefix matching: find nodes whose ID string starts with the given prefix
+                    let prefix = id.to_lowercase();
+                    let matches: Vec<EndpointId> = ctx
+                        .nodes
+                        .iter()
+                        .filter(|e| !clients.is_client_node(e.key()))
+                        .filter(|e| e.key().to_string().to_lowercase().starts_with(&prefix))
+                        .map(|e| *e.key())
+                        .collect();
+
+                    match matches.len() {
+                        0 => {
+                            return CommandOutcome {
+                                response: ClientResponse::Error(format!(
+                                    "No node found matching prefix '{}'",
+                                    id
+                                )),
+                                action: None,
+                            };
+                        }
+                        1 => matches[0],
+                        n => {
+                            return CommandOutcome {
+                                response: ClientResponse::Error(format!(
+                                    "Ambiguous prefix '{}': matches {} nodes. Provide more characters.",
+                                    id, n
+                                )),
+                                action: None,
+                            };
+                        }
+                    }
                 }
             };
 
@@ -209,17 +237,24 @@ pub async fn handle_command(
                 };
             }
 
+            let domain = ctx.nodes.get(&node_id).map(|n| n.value().domain.clone());
             clients.remove_client(&node_id);
             ctx.nodes.remove(&node_id);
             if let Err(e) = ctx.storage.remove_node(&node_id) {
                 return CommandOutcome {
-                    response: ClientResponse::Error(format!("Failed to remove from storage: {e}")),
+                    response: ClientResponse::Error(format!(
+                        "Failed to remove from storage: {e}"
+                    )),
                     action: None,
                 };
             }
 
+            let msg = match domain {
+                Some(d) => format!("Node removed: {} ({})", d, node_id),
+                None => format!("Node removed: {}", node_id),
+            };
             CommandOutcome {
-                response: ClientResponse::Ack,
+                response: ClientResponse::Ack(msg),
                 action: None,
             }
         }
@@ -249,19 +284,19 @@ pub async fn handle_command(
         ClientCommand::Pause => {
             ctx.set_paused(true);
             CommandOutcome {
-                response: ClientResponse::Ack,
+                response: ClientResponse::Ack("Daemon paused".to_string()),
                 action: None,
             }
         }
         ClientCommand::Resume => {
             ctx.set_paused(false);
             CommandOutcome {
-                response: ClientResponse::Ack,
+                response: ClientResponse::Ack("Daemon resumed".to_string()),
                 action: None,
             }
         }
         ClientCommand::Shutdown => CommandOutcome {
-            response: ClientResponse::Ack,
+            response: ClientResponse::Ack("Daemon shutting down".to_string()),
             action: Some(AdminAction::Shutdown),
         },
     }

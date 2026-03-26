@@ -31,3 +31,15 @@ fn client_requires_subcommand() {
         "missing client subcommand should fail"
     );
 }
+
+#[test]
+fn client_node_subcommand_help_succeeds() {
+    let out = client_bin()
+        .args(["node", "--help"])
+        .output()
+        .expect("run p2p-ddnsctl node --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("add"), "should list 'add' subcommand");
+    assert!(stdout.contains("remove"), "should list 'remove' subcommand");
+}
