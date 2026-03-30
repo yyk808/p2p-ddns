@@ -83,14 +83,18 @@ case "${ARCHIVE_PATH}" in
     tar -C "${OUT_DIR}" -czf "${ARCHIVE_PATH}" "${ARCHIVE_STEM}"
     ;;
   *.zip)
-    if ! command -v zip >/dev/null 2>&1; then
-      echo "zip not found; install zip to build Windows archives" >&2
+    if command -v zip >/dev/null 2>&1; then
+      (
+        cd "${OUT_DIR}"
+        zip -qr "${ARCHIVE_PATH}" "${ARCHIVE_STEM}"
+      )
+    elif command -v powershell.exe >/dev/null 2>&1; then
+      powershell.exe -NoLogo -NoProfile -Command \
+        "Compress-Archive -Path '${STAGE_DIR}' -DestinationPath '${ARCHIVE_PATH}' -Force" >/dev/null
+    else
+      echo "zip not found; install zip or PowerShell to build Windows archives" >&2
       exit 1
     fi
-    (
-      cd "${OUT_DIR}"
-      zip -qr "${ARCHIVE_PATH}" "${ARCHIVE_STEM}"
-    )
     ;;
 esac
 

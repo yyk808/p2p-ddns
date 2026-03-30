@@ -46,6 +46,29 @@ async fn connect_retry(addr: SocketAddr) -> Result<TcpStream> {
     }
 }
 
+async fn spawn_http_server(
+    bind: SocketAddr,
+    ctx: Arc<p2p_ddns::net::Context>,
+    clients: Arc<ClientRegistry>,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let local_addr = listener.local_addr()?;
+    drop(listener);
+
+    let server_bind = SocketAddr::new(bind.ip(), local_addr.port());
+    let connect_addr = if server_bind.ip().is_unspecified() {
+        SocketAddr::new("127.0.0.1".parse().unwrap(), server_bind.port())
+    } else {
+        server_bind
+    };
+
+    let srv = tokio::spawn(async move {
+        let _ = http::run_http_server(server_bind, ctx, clients).await;
+    });
+
+    Ok((connect_addr, srv))
+}
+
 async fn send_http_post(
     addr: SocketAddr,
     path: &str,
@@ -101,24 +124,14 @@ async fn send_http_get(addr: SocketAddr, path: &str) -> Result<u16> {
 #[tokio::test]
 async fn http_auth_and_command_get_ticket_work_over_loopback() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-
-    let srv = tokio::spawn({
-        let ctx = ctx.clone();
-        let clients = clients.clone();
-        async move {
-            let _ = http::run_http_server(addr, ctx, clients).await;
-        }
-    });
+    let (addr, srv) =
+        spawn_http_server("127.0.0.1:0".parse().unwrap(), ctx.clone(), clients.clone()).await?;
 
     let mut rng = rand::rng();
     let sk = SecretKey::generate(&mut rng);
     let pk = sk.public();
     let auth = AuthRequest {
-        ticket: ctx.ticket.to_string(),
+        ticket: String::new(),
         client_public_key: Some(
             base64::engine::general_purpose::STANDARD_NO_PAD.encode(pk.as_bytes()),
         ),
@@ -153,18 +166,7 @@ async fn http_auth_and_command_get_ticket_work_over_loopback() -> Result<()> {
 #[tokio::test]
 async fn http_rejects_wrong_content_type() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-
-    let srv = tokio::spawn({
-        let ctx = ctx.clone();
-        let clients = clients.clone();
-        async move {
-            let _ = http::run_http_server(addr, ctx, clients).await;
-        }
-    });
+    let (addr, srv) = spawn_http_server("127.0.0.1:0".parse().unwrap(), ctx, clients).await?;
 
     let (status, _body) = send_http_post(addr, "/auth", "application/json", b"{}").await?;
     assert_eq!(status, 415);
@@ -176,18 +178,7 @@ async fn http_rejects_wrong_content_type() -> Result<()> {
 #[tokio::test]
 async fn http_rejects_wrong_method_and_unknown_path() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-
-    let srv = tokio::spawn({
-        let ctx = ctx.clone();
-        let clients = clients.clone();
-        async move {
-            let _ = http::run_http_server(addr, ctx, clients).await;
-        }
-    });
+    let (addr, srv) = spawn_http_server("127.0.0.1:0".parse().unwrap(), ctx, clients).await?;
 
     assert_eq!(send_http_get(addr, "/auth").await?, 405);
     let (status, _body) = send_http_post(addr, "/nope", "application/postcard", b"").await?;
@@ -198,20 +189,9 @@ async fn http_rejects_wrong_method_and_unknown_path() -> Result<()> {
 }
 
 #[tokio::test]
-async fn http_command_rejects_invalid_ticket() -> Result<()> {
+async fn http_command_rejects_invalid_ticket_on_non_loopback_bind() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-
-    let srv = tokio::spawn({
-        let ctx = ctx.clone();
-        let clients = clients.clone();
-        async move {
-            let _ = http::run_http_server(addr, ctx, clients).await;
-        }
-    });
+    let (addr, srv) = spawn_http_server("0.0.0.0:0".parse().unwrap(), ctx, clients).await?;
 
     let bad_auth = AuthRequest {
         ticket: "not-a-ticket".to_string(),
@@ -236,18 +216,7 @@ async fn http_command_rejects_invalid_ticket() -> Result<()> {
 #[tokio::test]
 async fn http_command_rejects_missing_ticket() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-
-    let srv = tokio::spawn({
-        let ctx = ctx.clone();
-        let clients = clients.clone();
-        async move {
-            let _ = http::run_http_server(addr, ctx, clients).await;
-        }
-    });
+    let (addr, srv) = spawn_http_server("0.0.0.0:0".parse().unwrap(), ctx, clients).await?;
 
     let req = AdminCommandRequest {
         auth: AuthRequest {
@@ -271,21 +240,11 @@ async fn http_command_rejects_missing_ticket() -> Result<()> {
 #[tokio::test]
 async fn http_command_requires_client_public_key() -> Result<()> {
     let (ctx, clients) = make_ctx_and_clients().await?;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-
-    let srv = tokio::spawn({
-        let ctx = ctx.clone();
-        let clients = clients.clone();
-        async move {
-            let _ = http::run_http_server(addr, ctx, clients).await;
-        }
-    });
+    let (addr, srv) =
+        spawn_http_server("127.0.0.1:0".parse().unwrap(), ctx.clone(), clients).await?;
 
     let auth = AuthRequest {
-        ticket: ctx.ticket.to_string(),
+        ticket: String::new(),
         client_public_key: None,
         client_name: Some("http".to_string()),
     };

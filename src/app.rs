@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -25,8 +25,12 @@ use crate::{
 )]
 pub struct ClientArgs {
     /// Path to daemon's Unix socket; defaults to XDG_RUNTIME_DIR or /run.
-    #[arg(long, value_name = "SOCKET_PATH")]
+    #[arg(long, value_name = "SOCKET_PATH", conflicts_with = "admin_http")]
     pub socket_path: Option<PathBuf>,
+
+    /// Connect to the daemon over HTTP instead of the local socket (for example `127.0.0.1:8080`).
+    #[arg(long, value_name = "ADMIN_HTTP", conflicts_with = "socket_path")]
+    pub admin_http: Option<String>,
 
     /// Request timeout in seconds
     #[arg(long, default_value_t = 5)]
@@ -160,11 +164,16 @@ pub async fn run_daemon(mut args: DaemonArgs) -> Result<()> {
 }
 
 pub async fn run_client(args: ClientArgs) -> Result<()> {
-    let socket_path = get_socket_path(&args.socket_path);
-    let mut stream = connect_to_daemon(&socket_path, args.timeout).await?;
     let ticket = args.ticket.clone().or_else(|| get_ticket().ok());
-    let _client_pk = authenticate(&mut stream, ticket.as_deref()).await?;
-    execute_command(&mut stream, args.command, args.json).await?;
+    let auth = build_auth_request(ticket.as_deref()).await?;
+    let response = if let Some(bind) = args.admin_http.as_deref() {
+        let bind = util::parse_bind_addr(bind)?;
+        run_http_client(bind, args.timeout, auth, args.command).await?
+    } else {
+        let socket_path = get_socket_path(&args.socket_path);
+        run_socket_client(socket_path, args.timeout, auth, args.command).await?
+    };
+    display_response(response, args.json)?;
     Ok(())
 }
 
@@ -279,10 +288,7 @@ async fn connect_to_daemon(
     )
 }
 
-async fn authenticate(
-    stream: &mut tokio::net::UnixStream,
-    ticket: Option<&str>,
-) -> Result<iroh::PublicKey> {
+async fn build_auth_request(ticket: Option<&str>) -> Result<AuthRequest> {
     let storage = init_client_storage().await?;
     let (pk, _sk) = storage.load_secret()?.unwrap_or_else(|| {
         let mut rng = rand::rng();
@@ -292,17 +298,33 @@ async fn authenticate(
         (pk, sk)
     });
 
-    let auth_req = AuthRequest {
+    Ok(AuthRequest {
         ticket: ticket.unwrap_or_default().to_string(),
         client_public_key: Some(
             base64::engine::general_purpose::STANDARD_NO_PAD.encode(pk.as_bytes()),
         ),
         client_name: Some("cli".to_string()),
-    };
-    send_message(stream, &auth_req).await?;
+    })
+}
+
+async fn run_socket_client(
+    socket_path: PathBuf,
+    timeout_sec: u64,
+    auth: AuthRequest,
+    command: ClientCommandArgs,
+) -> Result<ClientResponse> {
+    let mut stream = connect_to_daemon(&socket_path, timeout_sec).await?;
+    authenticate_socket(&mut stream, &auth).await?;
+    execute_socket_command(&mut stream, command).await
+}
+
+async fn authenticate_socket(
+    stream: &mut tokio::net::UnixStream,
+    auth: &AuthRequest,
+) -> Result<()> {
+    send_message(stream, auth).await?;
 
     let auth_resp: AuthResponse = read_message(stream).await?;
-
     if !auth_resp.success {
         Err(anyhow::anyhow!(
             "Authentication failed: {}",
@@ -311,16 +333,109 @@ async fn authenticate(
                 .unwrap_or_else(|| "Unknown error".to_string())
         ))
     } else {
-        Ok(pk)
+        Ok(())
     }
 }
 
-async fn execute_command(
+async fn execute_socket_command(
     stream: &mut tokio::net::UnixStream,
     command: ClientCommandArgs,
-    json: bool,
-) -> Result<()> {
-    let cmd = match command {
+) -> Result<ClientResponse> {
+    let cmd = to_client_command(command);
+    send_message(stream, &cmd).await?;
+    read_message(stream).await
+}
+
+async fn run_http_client(
+    bind: SocketAddr,
+    timeout_sec: u64,
+    auth: AuthRequest,
+    command: ClientCommandArgs,
+) -> Result<ClientResponse> {
+    authenticate_http(bind, timeout_sec, &auth).await?;
+    let request = AdminCommandRequest {
+        auth,
+        command: to_client_command(command),
+    };
+    let (status, resp_body) = send_http_post(bind, timeout_sec, "/command", &request).await?;
+    match status {
+        200 | 403 => Ok(postcard::from_bytes(&resp_body)?),
+        401 => {
+            let auth_resp: AuthResponse = postcard::from_bytes(&resp_body)?;
+            Err(anyhow::anyhow!(
+                "Authentication failed: {}",
+                auth_resp
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string())
+            ))
+        }
+        _ => Err(anyhow::anyhow!(
+            "HTTP command failed with status {}",
+            status
+        )),
+    }
+}
+
+async fn authenticate_http(bind: SocketAddr, timeout_sec: u64, auth: &AuthRequest) -> Result<()> {
+    let (status, resp_body) = send_http_post(bind, timeout_sec, "/auth", auth).await?;
+    if status != 200 {
+        return Err(anyhow::anyhow!("HTTP auth failed with status {}", status));
+    }
+
+    let auth_resp: AuthResponse = postcard::from_bytes(&resp_body)?;
+    if !auth_resp.success {
+        Err(anyhow::anyhow!(
+            "Authentication failed: {}",
+            auth_resp
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string())
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn send_http_post<T: serde::Serialize>(
+    bind: SocketAddr,
+    timeout_sec: u64,
+    path: &str,
+    body: &T,
+) -> Result<(u16, Vec<u8>)> {
+    let timeout = tokio::time::Duration::from_secs(timeout_sec);
+    let request_body = postcard::to_stdvec(body)?;
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(bind))
+        .await
+        .map_err(|_| anyhow::anyhow!("Failed to connect to HTTP admin endpoint at {}", bind))??;
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {bind}\r\nContent-Type: application/postcard\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request_body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.write_all(&request_body).await?;
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await?;
+    parse_http_response(&resp)
+}
+
+fn parse_http_response(resp: &[u8]) -> Result<(u16, Vec<u8>)> {
+    let header_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("missing response header terminator"))?;
+    let header = std::str::from_utf8(&resp[..header_end])?;
+    let status = header
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .ok_or_else(|| anyhow::anyhow!("bad status line"))?
+        .parse::<u16>()?;
+    Ok((status, resp[header_end + 4..].to_vec()))
+}
+
+fn to_client_command(command: ClientCommandArgs) -> ClientCommand {
+    match command {
         ClientCommandArgs::List => ClientCommand::Query,
         ClientCommandArgs::Status => ClientCommand::Status,
         ClientCommandArgs::Node {
@@ -333,11 +448,10 @@ async fn execute_command(
         ClientCommandArgs::Pause => ClientCommand::Pause,
         ClientCommandArgs::Resume => ClientCommand::Resume,
         ClientCommandArgs::Stop => ClientCommand::Shutdown,
-    };
+    }
+}
 
-    send_message(stream, &cmd).await?;
-    let response: ClientResponse = read_message(stream).await?;
-
+fn display_response(response: ClientResponse, json: bool) -> Result<()> {
     match response {
         ClientResponse::Nodes(nodes) => {
             if json {
@@ -371,10 +485,7 @@ async fn execute_command(
                     }
                 }
                 if !json {
-                    output::display_info(&format!(
-                        "Ticket saved to {}",
-                        ticket_path.display()
-                    ));
+                    output::display_info(&format!("Ticket saved to {}", ticket_path.display()));
                 }
             }
         }

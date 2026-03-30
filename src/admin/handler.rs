@@ -242,9 +242,7 @@ pub async fn handle_command(
             ctx.nodes.remove(&node_id);
             if let Err(e) = ctx.storage.remove_node(&node_id) {
                 return CommandOutcome {
-                    response: ClientResponse::Error(format!(
-                        "Failed to remove from storage: {e}"
-                    )),
+                    response: ClientResponse::Error(format!("Failed to remove from storage: {e}")),
                     action: None,
                 };
             }

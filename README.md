@@ -62,10 +62,12 @@ pushed:
 - Linux `x86_64` and `aarch64` `.tar.gz` archives
 - Linux `x86_64` and `aarch64` `.deb` packages
 - macOS `x86_64` and `aarch64` `.tar.gz` archives
+- Windows `x86_64` `.zip` archives
 - `SHA256SUMS.txt` for artifact verification
 
-Current release automation does not publish Windows builds yet because the local admin client/server
-still uses Unix domain sockets.
+`p2p-ddnsctl` can connect either through the local socket or through the daemon's HTTP admin
+endpoint. Local loopback HTTP listeners allow ticketless management; non-loopback HTTP listeners
+require a valid ticket.
 
 ## Usage
 
@@ -127,6 +129,19 @@ optional HTTP admin endpoint.
 cargo run --bin p2p-ddnsctl -- status
 cargo run --bin p2p-ddnsctl -- list
 cargo run --bin p2p-ddnsctl -- get-ticket
+```
+
+To talk to the daemon over HTTP instead of the local socket:
+
+```bash
+cargo run --bin p2p-ddnsctl -- --admin-http 127.0.0.1:8080 status
+```
+
+Loopback HTTP listeners allow ticketless local management. Non-loopback listeners require a valid
+ticket:
+
+```bash
+cargo run --bin p2p-ddnsctl -- --admin-http 192.168.1.10:8080 --ticket <TICKET_STRING> status
 ```
 
 ### Enable hosts-based DDNS

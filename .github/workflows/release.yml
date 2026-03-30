@@ -53,6 +53,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     needs: verify
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +78,11 @@ jobs:
           - label: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
+            build_deb: false
+            deb_arch: ""
+          - label: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
             build_deb: false
             deb_arch: ""
 

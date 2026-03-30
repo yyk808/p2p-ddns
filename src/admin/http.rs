@@ -22,6 +22,7 @@ pub async fn run_http_server(
     clients: Arc<ClientRegistry>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind).await?;
+    let auth_mode = auth_mode_for_bind(bind);
     info!("Admin HTTP listening on http://{}", bind);
 
     loop {
@@ -29,16 +30,25 @@ pub async fn run_http_server(
         let ctx = ctx.clone();
         let clients = clients.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut stream, peer, &ctx, &clients).await {
+            if let Err(e) = handle_connection(&mut stream, peer, auth_mode, &ctx, &clients).await {
                 error!("Admin HTTP error ({}): {}", peer, e);
             }
         });
     }
 }
 
+fn auth_mode_for_bind(bind: SocketAddr) -> AuthMode {
+    if bind.ip().is_loopback() {
+        AuthMode::AllowLocalTicketless
+    } else {
+        AuthMode::RequireTicket
+    }
+}
+
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     _peer: SocketAddr,
+    auth_mode: AuthMode,
     ctx: &Context,
     clients: &ClientRegistry,
 ) -> Result<()> {
@@ -60,23 +70,15 @@ async fn handle_connection(
     match path.as_str() {
         "/auth" => {
             let auth_req: AuthRequest = postcard::from_bytes(&body)?;
-            let (auth_resp, _client_id) = handler::authenticate_and_register(
-                ctx,
-                clients,
-                &auth_req,
-                AuthMode::RequireTicket,
-            )?;
+            let (auth_resp, _client_id) =
+                handler::authenticate_and_register(ctx, clients, &auth_req, auth_mode)?;
             let resp_body = postcard::to_stdvec(&auth_resp)?;
             write_response(stream, 200, "application/postcard", &resp_body).await
         }
         "/command" => {
             let req: AdminCommandRequest = postcard::from_bytes(&body)?;
-            let (auth_resp, client_id) = handler::authenticate_and_register(
-                ctx,
-                clients,
-                &req.auth,
-                AuthMode::RequireTicket,
-            )?;
+            let (auth_resp, client_id) =
+                handler::authenticate_and_register(ctx, clients, &req.auth, auth_mode)?;
             if !auth_resp.success {
                 let resp_body = postcard::to_stdvec(&auth_resp)?;
                 return write_response(stream, 401, "application/postcard", &resp_body).await;

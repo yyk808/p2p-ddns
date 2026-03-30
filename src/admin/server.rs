@@ -37,23 +37,32 @@ pub fn socket_path_candidates() -> Vec<PathBuf> {
         push_candidate(&mut candidates, PathBuf::from(path));
         return candidates;
     }
-    if let Some(xdg_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        push_candidate(
-            &mut candidates,
-            PathBuf::from(xdg_runtime).join("p2p-ddns.sock"),
-        );
-    }
-    if let Some(runtime_dir) = std::env::var_os("RUNTIME_DIR") {
-        push_candidate(
-            &mut candidates,
-            PathBuf::from(runtime_dir).join("p2p-ddns.sock"),
-        );
-    }
+    if cfg!(windows) {
+        if let Some(local_data) = dirs::data_local_dir() {
+            push_candidate(
+                &mut candidates,
+                local_data.join("p2p-ddns").join("p2p-ddns.sock"),
+            );
+        }
+    } else {
+        if let Some(xdg_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            push_candidate(
+                &mut candidates,
+                PathBuf::from(xdg_runtime).join("p2p-ddns.sock"),
+            );
+        }
+        if let Some(runtime_dir) = std::env::var_os("RUNTIME_DIR") {
+            push_candidate(
+                &mut candidates,
+                PathBuf::from(runtime_dir).join("p2p-ddns.sock"),
+            );
+        }
 
-    push_candidate(&mut candidates, PathBuf::from("/run/p2p-ddns.sock"));
+        push_candidate(&mut candidates, PathBuf::from("/run/p2p-ddns.sock"));
 
-    if let Some(runtime_dir) = dirs::runtime_dir() {
-        push_candidate(&mut candidates, runtime_dir.join("p2p-ddns.sock"));
+        if let Some(runtime_dir) = dirs::runtime_dir() {
+            push_candidate(&mut candidates, runtime_dir.join("p2p-ddns.sock"));
+        }
     }
 
     if let Some(cache_dir) = dirs::cache_dir() {

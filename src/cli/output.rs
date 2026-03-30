@@ -63,7 +63,10 @@ pub fn print(ctx: &Context) {
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
             let alias = node.domain.clone();
-            let last_seen = format!("{} ago", format_duration(now.saturating_sub(node.last_heartbeat)));
+            let last_seen = format!(
+                "{} ago",
+                format_duration(now.saturating_sub(node.last_heartbeat))
+            );
             (addr, alias, last_seen)
         })
         .collect::<Vec<_>>();
@@ -126,7 +129,11 @@ fn last_seen_cell(seconds: u64) -> Cell {
     } else {
         Color::Red
     };
-    styled_cell(format!("{} ago", format_duration(seconds)), Some(color), false)
+    styled_cell(
+        format!("{} ago", format_duration(seconds)),
+        Some(color),
+        false,
+    )
 }
 
 fn terminal_width() -> Option<usize> {
@@ -234,7 +241,11 @@ pub fn display_nodes(nodes: &[Node]) {
     if nodes.is_empty() {
         println!(
             "\n{}",
-            colorize("No nodes found in the network.", Some(Color::DarkGrey), false)
+            colorize(
+                "No nodes found in the network.",
+                Some(Color::DarkGrey),
+                false
+            )
         );
         println!(
             "{}",
@@ -470,7 +481,10 @@ pub fn display_info(message: &str) {
 }
 
 pub fn display_error(message: &str) {
-    eprintln!("\n{}", colorize(format!("Error: {}", message), Some(Color::Red), true));
+    eprintln!(
+        "\n{}",
+        colorize(format!("Error: {}", message), Some(Color::Red), true)
+    );
 }
 
 // --- JSON output functions ---
