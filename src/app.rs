@@ -269,6 +269,7 @@ fn get_socket_path(override_path: &Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(crate::admin::server::default_socket_path)
 }
 
+#[cfg(unix)]
 async fn connect_to_daemon(
     socket_path: &PathBuf,
     timeout_sec: u64,
@@ -286,6 +287,11 @@ async fn connect_to_daemon(
                 )
             })??,
     )
+}
+
+#[cfg(not(unix))]
+async fn connect_to_daemon(_socket_path: &PathBuf, _timeout_sec: u64) -> Result<()> {
+    anyhow::bail!("Local socket admin is unavailable on this platform; use --admin-http instead")
 }
 
 async fn build_auth_request(ticket: Option<&str>) -> Result<AuthRequest> {
@@ -307,6 +313,7 @@ async fn build_auth_request(ticket: Option<&str>) -> Result<AuthRequest> {
     })
 }
 
+#[cfg(unix)]
 async fn run_socket_client(
     socket_path: PathBuf,
     timeout_sec: u64,
@@ -318,6 +325,17 @@ async fn run_socket_client(
     execute_socket_command(&mut stream, command).await
 }
 
+#[cfg(not(unix))]
+async fn run_socket_client(
+    _socket_path: PathBuf,
+    _timeout_sec: u64,
+    _auth: AuthRequest,
+    _command: ClientCommandArgs,
+) -> Result<ClientResponse> {
+    anyhow::bail!("Local socket admin is unavailable on this platform; use --admin-http instead")
+}
+
+#[cfg(unix)]
 async fn authenticate_socket(
     stream: &mut tokio::net::UnixStream,
     auth: &AuthRequest,
@@ -337,6 +355,7 @@ async fn authenticate_socket(
     }
 }
 
+#[cfg(unix)]
 async fn execute_socket_command(
     stream: &mut tokio::net::UnixStream,
     command: ClientCommandArgs,
@@ -523,6 +542,7 @@ fn get_client_config_path() -> PathBuf {
         .join("p2p-ddns")
 }
 
+#[cfg(unix)]
 async fn send_message<T: serde::Serialize>(
     stream: &mut tokio::net::UnixStream,
     msg: &T,
@@ -534,6 +554,7 @@ async fn send_message<T: serde::Serialize>(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn read_message<T: for<'a> serde::Deserialize<'a>>(
     stream: &mut tokio::net::UnixStream,
 ) -> Result<T> {

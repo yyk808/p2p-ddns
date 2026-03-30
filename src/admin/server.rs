@@ -1,13 +1,19 @@
-use std::{
-    io::ErrorKind,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
+#[cfg(unix)]
+use std::{io::ErrorKind, path::Path};
+
+#[cfg(unix)]
 use anyhow::Result;
-use log::{error, info, warn};
+use log::warn;
+#[cfg(unix)]
+use log::{error, info};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
+#[cfg(not(unix))]
+use crate::{admin::authz::ClientRegistry, net::Context};
+#[cfg(unix)]
 use crate::{
     admin::{
         authz::ClientRegistry,
@@ -81,7 +87,16 @@ pub fn socket_path_candidates() -> Vec<PathBuf> {
 }
 
 pub async fn run_default_management_server(ctx: Arc<Context>, clients: Arc<ClientRegistry>) {
+    #[cfg(unix)]
     run_management_server_with_candidates(socket_path_candidates(), ctx, clients).await;
+
+    #[cfg(not(unix))]
+    {
+        let _ = (ctx, clients);
+        warn!(
+            "Local socket admin server is unavailable on this platform; use --admin-http instead"
+        );
+    }
 }
 
 pub async fn run_management_server(
@@ -89,9 +104,19 @@ pub async fn run_management_server(
     ctx: Arc<Context>,
     clients: Arc<ClientRegistry>,
 ) {
+    #[cfg(unix)]
     run_management_server_with_candidates(vec![socket_path], ctx, clients).await;
+
+    #[cfg(not(unix))]
+    {
+        let _ = (socket_path, ctx, clients);
+        warn!(
+            "Local socket admin server is unavailable on this platform; use --admin-http instead"
+        );
+    }
 }
 
+#[cfg(unix)]
 async fn run_management_server_with_candidates(
     candidates: Vec<PathBuf>,
     ctx: Arc<Context>,
@@ -121,6 +146,7 @@ async fn run_management_server_with_candidates(
     error!("Failed to initialize the admin socket on any candidate path");
 }
 
+#[cfg(unix)]
 fn try_bind_management_socket(socket_path: &Path) -> Result<UnixListener, SocketSetupError> {
     if socket_path.exists() {
         std::fs::remove_file(socket_path).ok();
@@ -157,6 +183,7 @@ fn try_bind_management_socket(socket_path: &Path) -> Result<UnixListener, Socket
     Ok(listener)
 }
 
+#[cfg(unix)]
 async fn accept_loop(listener: UnixListener, ctx: Arc<Context>, clients: Arc<ClientRegistry>) {
     loop {
         match listener.accept().await {
@@ -174,6 +201,7 @@ async fn accept_loop(listener: UnixListener, ctx: Arc<Context>, clients: Arc<Cli
     }
 }
 
+#[cfg(unix)]
 fn log_socket_setup_failure(
     action: &str,
     target: &Path,
@@ -210,6 +238,7 @@ fn log_socket_setup_failure(
     }
 }
 
+#[cfg(unix)]
 struct SocketSetupError {
     action: String,
     target: PathBuf,
@@ -217,6 +246,7 @@ struct SocketSetupError {
     error: std::io::Error,
 }
 
+#[cfg(unix)]
 async fn handle_client_connection(
     mut stream: tokio::net::UnixStream,
     ctx: Arc<Context>,
@@ -281,6 +311,7 @@ async fn handle_client_connection(
     }
 }
 
+#[cfg(unix)]
 async fn read_message<T: for<'a> serde::Deserialize<'a>>(
     stream: &mut tokio::net::UnixStream,
 ) -> Result<T> {
@@ -301,6 +332,7 @@ async fn read_message<T: for<'a> serde::Deserialize<'a>>(
     Ok(msg)
 }
 
+#[cfg(unix)]
 async fn send_message<T: serde::Serialize>(
     stream: &mut tokio::net::UnixStream,
     msg: &T,
