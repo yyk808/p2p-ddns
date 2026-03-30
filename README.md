@@ -54,6 +54,19 @@ server.
 cargo build
 ```
 
+## Release Artifacts
+
+GitHub Releases publish the following artifacts automatically when a new tag such as `v0.2.0` is
+pushed:
+
+- Linux `x86_64` and `aarch64` `.tar.gz` archives
+- Linux `x86_64` and `aarch64` `.deb` packages
+- macOS `x86_64` and `aarch64` `.tar.gz` archives
+- `SHA256SUMS.txt` for artifact verification
+
+Current release automation does not publish Windows builds yet because the local admin client/server
+still uses Unix domain sockets.
+
 ## Usage
 
 Installed binaries:

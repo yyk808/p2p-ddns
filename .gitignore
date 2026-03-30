@@ -4,6 +4,7 @@
 .claude/
 
 /target
+/dist
 
 # Local test artifacts (ad-hoc scripts)
 test-data/

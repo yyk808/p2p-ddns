@@ -7,6 +7,7 @@ build_deb.sh
 
 Build a simple .deb package for Ubuntu/Debian that installs:
   - /usr/bin/p2p-ddns
+  - /usr/bin/p2p-ddnsctl
   - /usr/lib/p2p-ddns/p2p-ddns-wrapper
   - /lib/systemd/system/p2p-ddns.service
   - /etc/default/p2p-ddns (conffile)
@@ -50,9 +51,10 @@ DEB_VERSION="${DEB_VERSION:-}"
 if [[ -z "${DEB_VERSION}" ]]; then
   DEB_VERSION="$(awk -F '\"' '/^version = / {print $2; exit}' "${ROOT}/Cargo.toml")"
 fi
+DEB_VERSION="${DEB_VERSION#v}"
 
 DEB_ARCH="${DEB_ARCH:-}"
-if [[ -z "${DEB_ARCH}" ]]; then
+if [[ -z "${DEB_ARCH}" ]] && command -v dpkg >/dev/null 2>&1; then
   DEB_ARCH="$(dpkg --print-architecture)"
 fi
 
@@ -103,6 +105,7 @@ echo "  target=${TARGET:-<native>}"
 pushd "${ROOT}" >/dev/null
 
 BUILD_ARGS=(build --release)
+BUILD_ARGS+=(--bin p2p-ddns --bin p2p-ddnsctl)
 if [[ -n "${TARGET}" ]]; then
   BUILD_ARGS+=(--target "${TARGET}")
 fi
@@ -132,14 +135,22 @@ case "${BUILDER}" in
 esac
 
 BIN_PATH=""
+CTL_PATH=""
 if [[ -n "${TARGET}" ]]; then
   BIN_PATH="${ROOT}/target/${TARGET}/release/p2p-ddns"
+  CTL_PATH="${ROOT}/target/${TARGET}/release/p2p-ddnsctl"
 else
   BIN_PATH="${ROOT}/target/release/p2p-ddns"
+  CTL_PATH="${ROOT}/target/release/p2p-ddnsctl"
 fi
 
 if [[ ! -x "${BIN_PATH}" ]]; then
   echo "built binary not found: ${BIN_PATH}" >&2
+  exit 1
+fi
+
+if [[ ! -x "${CTL_PATH}" ]]; then
+  echo "built binary not found: ${CTL_PATH}" >&2
   exit 1
 fi
 
@@ -154,6 +165,7 @@ mkdir -p "${STAGE}/DEBIAN" \
   "${STAGE}/etc/default"
 
 install -m 0755 "${BIN_PATH}" "${STAGE}/usr/bin/p2p-ddns"
+install -m 0755 "${CTL_PATH}" "${STAGE}/usr/bin/p2p-ddnsctl"
 install -m 0755 "${ROOT}/packaging/systemd/p2p-ddns-wrapper" "${STAGE}/usr/lib/${DEB_NAME}/p2p-ddns-wrapper"
 install -m 0644 "${ROOT}/packaging/systemd/p2p-ddns.service" "${STAGE}/lib/systemd/system/p2p-ddns.service"
 install -m 0644 "${ROOT}/packaging/systemd/p2p-ddns.default" "${STAGE}/etc/default/p2p-ddns"
