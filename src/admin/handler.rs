@@ -257,9 +257,13 @@ pub async fn handle_command(
             }
         }
         ClientCommand::Status => {
-            let my_addr = util::best_ip_for_display(&ctx.handle.addr())
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| format!("{:?}", ctx.handle.addr()));
+            let my_addr = if crate::net::should_filter_advertised_addrs(&ctx.args) {
+                util::best_local_ip_for_display(&ctx.handle.addr())
+            } else {
+                util::best_ip_for_display(&ctx.handle.addr())
+            }
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| format!("{:?}", ctx.handle.addr()));
             let status = crate::domain::client::DaemonStatus {
                 running: true,
                 paused: ctx.is_paused(),

@@ -69,7 +69,7 @@ pub struct Context {
     hosts_sync: Arc<RwLock<HostsSyncStatus>>,
 }
 
-fn should_filter_advertised_addrs(args: &DaemonArgs) -> bool {
+pub(crate) fn should_filter_advertised_addrs(args: &DaemonArgs) -> bool {
     args.bind.is_none() && args.bind_interface.is_none()
 }
 

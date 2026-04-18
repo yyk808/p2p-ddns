@@ -161,6 +161,28 @@ pub fn filter_advertisable_endpoint_addr(addr: &EndpointAddr) -> EndpointAddr {
     filter_advertisable_endpoint_addr_with_map(addr, &local_only_ip_map)
 }
 
+fn best_local_ip_for_display_with_map(
+    addr: &EndpointAddr,
+    local_only_ip_map: &HashMap<IpAddr, bool>,
+) -> Option<IpAddr> {
+    let mut best_v6: Option<IpAddr> = None;
+    for sock in addr.ip_addrs() {
+        let ip = sock.ip();
+        if is_local_only_ip(ip) || local_only_ip_map.get(&ip).copied().unwrap_or(false) {
+            continue;
+        }
+
+        if ip.is_ipv4() {
+            return Some(ip);
+        }
+
+        if best_v6.is_none() {
+            best_v6 = Some(ip);
+        }
+    }
+    best_v6
+}
+
 pub fn best_ip_for_display(addr: &EndpointAddr) -> Option<IpAddr> {
     let mut best_v6: Option<IpAddr> = None;
     for sock in addr.ip_addrs() {
@@ -178,6 +200,12 @@ pub fn best_ip_for_display(addr: &EndpointAddr) -> Option<IpAddr> {
         }
     }
     best_v6
+}
+
+pub fn best_local_ip_for_display(addr: &EndpointAddr) -> Option<IpAddr> {
+    let local_only_ip_map = local_only_interface_ip_map();
+    best_local_ip_for_display_with_map(addr, &local_only_ip_map)
+        .or_else(|| best_ip_for_display(addr))
 }
 
 fn common_prefix_bits(a: IpAddr, b: IpAddr) -> u32 {
@@ -356,6 +384,26 @@ mod tests {
         let v6: SocketAddr = "[2001:db8::2]:1".parse().unwrap();
         let addr = EndpointAddr::from_parts(pk, [TransportAddr::Ip(v6)]);
         assert_eq!(best_ip_for_display(&addr), Some(v6.ip()));
+    }
+
+    #[test]
+    fn best_local_ip_for_display_skips_local_only_interface_ips() {
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let local_only_v4: SocketAddr = "172.17.0.1:1".parse().unwrap();
+        let lan_v4: SocketAddr = "192.168.1.143:1".parse().unwrap();
+
+        let addr = EndpointAddr::from_parts(
+            pk,
+            [TransportAddr::Ip(local_only_v4), TransportAddr::Ip(lan_v4)],
+        );
+
+        assert_eq!(
+            best_local_ip_for_display_with_map(&addr, &HashMap::from([(local_only_v4.ip(), true)]),),
+            Some(lan_v4.ip())
+        );
     }
 
     #[test]
