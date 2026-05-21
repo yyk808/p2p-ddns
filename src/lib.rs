@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod agent_transport;
 pub mod app;
 pub mod cli;
 pub mod domain;

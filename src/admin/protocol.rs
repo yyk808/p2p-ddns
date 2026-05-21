@@ -21,6 +21,7 @@ pub struct AuthResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientCommand {
     Query,
+    ResolveNode { id_or_domain: String },
     AddNode { ticket: String },
     RemoveNode { id: String },
     Status,
@@ -34,6 +35,7 @@ pub enum ClientCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientResponse {
     Nodes(Vec<Node>),
+    Node(Option<Node>),
     Status(DaemonStatus),
     Ticket(String),
     Ack(String),

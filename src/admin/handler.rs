@@ -128,6 +128,7 @@ pub fn authenticate_and_register(
 pub fn required_permission(cmd: &ClientCommand) -> &'static str {
     match cmd {
         ClientCommand::Query => "query",
+        ClientCommand::ResolveNode { .. } => "query",
         ClientCommand::AddNode { .. } => "add_node",
         ClientCommand::RemoveNode { .. } => "remove_node",
         ClientCommand::Status => "query",
@@ -135,6 +136,58 @@ pub fn required_permission(cmd: &ClientCommand) -> &'static str {
         ClientCommand::Pause => "control",
         ClientCommand::Resume => "control",
         ClientCommand::Shutdown => "control",
+    }
+}
+
+fn resolve_active_daemon_node(
+    id_or_domain: &str,
+    ctx: &Context,
+    clients: &ClientRegistry,
+) -> std::result::Result<Option<Node>, String> {
+    let query = id_or_domain.trim();
+    if query.is_empty() {
+        return Err("Node id or domain is required".to_string());
+    }
+
+    let nodes = ctx
+        .nodes
+        .iter()
+        .filter(|e| !clients.is_client_node(e.key()))
+        .map(|e| e.value().clone())
+        .collect::<Vec<_>>();
+
+    if let Ok(node_id) = query.parse::<EndpointId>() {
+        return Ok(nodes.into_iter().find(|node| node.node_id == node_id));
+    }
+
+    let domain_matches = nodes
+        .iter()
+        .filter(|node| node.domain.eq_ignore_ascii_case(query))
+        .cloned()
+        .collect::<Vec<_>>();
+    match domain_matches.len() {
+        0 => {}
+        1 => return Ok(domain_matches.into_iter().next()),
+        n => {
+            return Err(format!(
+                "Ambiguous domain '{}': matches {} nodes. Use node id instead.",
+                query, n
+            ));
+        }
+    }
+
+    let prefix = query.to_lowercase();
+    let prefix_matches = nodes
+        .into_iter()
+        .filter(|node| node.node_id.to_string().to_lowercase().starts_with(&prefix))
+        .collect::<Vec<_>>();
+    match prefix_matches.len() {
+        0 => Ok(None),
+        1 => Ok(prefix_matches.into_iter().next()),
+        n => Err(format!(
+            "Ambiguous prefix '{}': matches {} nodes. Provide more characters.",
+            query, n
+        )),
     }
 }
 
@@ -153,6 +206,16 @@ pub async fn handle_command(
                 .collect();
             CommandOutcome {
                 response: ClientResponse::Nodes(nodes),
+                action: None,
+            }
+        }
+        ClientCommand::ResolveNode { id_or_domain } => {
+            let response = match resolve_active_daemon_node(id_or_domain, ctx, clients) {
+                Ok(node) => ClientResponse::Node(node),
+                Err(e) => ClientResponse::Error(e),
+            };
+            CommandOutcome {
+                response,
                 action: None,
             }
         }

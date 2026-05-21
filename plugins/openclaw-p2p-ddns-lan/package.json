@@ -1,0 +1,22 @@
+{
+  "name": "p2p-ddns-lan",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw channel plugin for p2p-ddns LAN discovery and direct agent messaging.",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "setupEntry": "./setup-entry.js",
+    "channel": {
+      "id": "p2p-ddns-lan",
+      "label": "p2p-ddns LAN",
+      "selectionLabel": "p2p-ddns LAN",
+      "detailLabel": "Direct LAN agents",
+      "blurb": "Use p2p-ddns discovery plus a direct LAN message transport for agent-to-agent communication.",
+      "markdownCapable": true,
+      "showConfigured": true
+    }
+  }
+}

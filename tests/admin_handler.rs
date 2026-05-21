@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use base64::Engine as _;
-use iroh::SecretKey;
+use iroh::{SecretKey, TransportAddr};
 use p2p_ddns::{
     admin::{authz::ClientRegistry, handler, protocol::*},
     cli::args::DaemonArgs,
@@ -111,6 +111,93 @@ async fn auth_registers_client_and_query_excludes_client_nodes() -> Result<()> {
         !nodes.iter().any(|n| n.node_id == id),
         "query should exclude client nodes"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_node_finds_active_daemon_by_domain_or_prefix() -> Result<()> {
+    let (ctx, clients) = make_context().await?;
+
+    let mut rng = rand::rng();
+    let pk = SecretKey::generate(&mut rng).public();
+    let addr: SocketAddr = "192.168.10.25:39091".parse()?;
+    let node = Node {
+        node_id: pk,
+        invitor: ctx.me.node_id,
+        addr: iroh::EndpointAddr::from_parts(pk, [TransportAddr::Ip(addr)]),
+        domain: "agent-b".to_string(),
+        services: Default::default(),
+        last_heartbeat: 42,
+    };
+    ctx.nodes.insert(pk, node.clone());
+
+    let outcome = handler::handle_command(
+        &ClientCommand::ResolveNode {
+            id_or_domain: "agent-b".to_string(),
+        },
+        &ctx,
+        &clients,
+    )
+    .await;
+    let resolved = match outcome.response {
+        ClientResponse::Node(Some(node)) => node,
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    };
+    assert_eq!(resolved.node_id, pk);
+    assert!(resolved.addr.ip_addrs().any(|candidate| candidate == &addr));
+
+    let prefix = pk.to_string().chars().take(12).collect::<String>();
+    let outcome = handler::handle_command(
+        &ClientCommand::ResolveNode {
+            id_or_domain: prefix,
+        },
+        &ctx,
+        &clients,
+    )
+    .await;
+    let resolved = match outcome.response {
+        ClientResponse::Node(Some(node)) => node,
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    };
+    assert_eq!(resolved.node_id, pk);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_node_excludes_registered_clients() -> Result<()> {
+    let (ctx, clients) = make_context().await?;
+
+    let mut rng = rand::rng();
+    let sk = SecretKey::generate(&mut rng);
+    let pk = sk.public();
+    let pk_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(pk.as_bytes());
+
+    let auth_req = AuthRequest {
+        ticket: ctx.ticket.to_string(),
+        client_public_key: Some(pk_b64),
+        client_name: Some("openclaw-client".to_string()),
+    };
+    let (resp, id) = handler::authenticate_and_register(
+        &ctx,
+        &clients,
+        &auth_req,
+        handler::AuthMode::RequireTicket,
+    )?;
+    assert!(resp.success);
+    assert_eq!(id, Some(pk));
+
+    let outcome = handler::handle_command(
+        &ClientCommand::ResolveNode {
+            id_or_domain: "openclaw-client".to_string(),
+        },
+        &ctx,
+        &clients,
+    )
+    .await;
+
+    assert!(matches!(outcome.response, ClientResponse::Node(None)));
 
     Ok(())
 }

@@ -1,0 +1,115 @@
+import {
+  dispatchInboundDirectDmWithRuntime,
+} from "openclaw/plugin-sdk/channel-inbound";
+import {
+  deliverFormattedTextWithAttachments,
+  type OutboundReplyPayload,
+} from "openclaw/plugin-sdk/reply-payload";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+
+import { sendTransportText, subscribeTransportEvents, type TransportEvent } from "./client.js";
+import { CHANNEL_ID, resolveLanAccount, type ResolvedLanAccount } from "./config.js";
+
+export async function startLanInboundBridge(
+  api: OpenClawPluginApi,
+): Promise<void> {
+  const cfg = api.config;
+  const account = resolveLanAccount(cfg, null);
+  const abort = new AbortController();
+  registerShutdown(api, abort);
+
+  await subscribeTransportEvents(
+    account,
+    async (event) => {
+      if (!isAllowedSender(account, event.message.from)) {
+        api.runtime?.log?.warn?.(
+          `[${CHANNEL_ID}] dropped message from disallowed sender ${event.message.from}`,
+        );
+        return;
+      }
+      await dispatchInboundEvent(api, account, event);
+    },
+    abort.signal,
+  );
+}
+
+async function dispatchInboundEvent(
+  api: OpenClawPluginApi,
+  account: ResolvedLanAccount,
+  event: TransportEvent,
+): Promise<void> {
+  const sender = event.message.from;
+  await dispatchInboundDirectDmWithRuntime({
+    cfg: api.config,
+    runtime: api.runtime,
+    channel: CHANNEL_ID,
+    channelLabel: "p2p-ddns LAN",
+    accountId: account.accountId ?? "default",
+    peer: { kind: "direct", id: sender },
+    senderId: sender,
+    senderAddress: sender,
+    recipientAddress: account.accountId ?? CHANNEL_ID,
+    conversationLabel: sender,
+    rawBody: event.message.text,
+    bodyForAgent: event.message.text,
+    commandBody: event.message.text,
+    messageId: event.message.id,
+    timestamp: event.message.timestamp,
+    commandAuthorized: true,
+    provider: CHANNEL_ID,
+    surface: CHANNEL_ID,
+    originatingChannel: CHANNEL_ID,
+    originatingTo: account.accountId ?? CHANNEL_ID,
+    extraContext: {
+      PeerAddr: event.peer_addr,
+      ReceivedAt: event.received_at,
+      ConversationId: event.message.conversation_id ?? sender,
+    },
+    deliver: async (payload) => {
+      await deliverReplyToSender(account, sender, event, payload);
+    },
+    onRecordError: (error) => {
+      api.logger.warn(
+        `[${CHANNEL_ID}] failed to record inbound message ${event.message.id}: ${String(error)}`,
+      );
+    },
+    onDispatchError: (error, info) => {
+      api.logger.warn(
+        `[${CHANNEL_ID}] failed to dispatch inbound message ${event.message.id} (${info.kind}): ${String(error)}`,
+      );
+    },
+  });
+}
+
+function isAllowedSender(account: ResolvedLanAccount, sender: string): boolean {
+  return account.allowFrom.length === 0 || account.allowFrom.includes(sender);
+}
+
+async function deliverReplyToSender(
+  account: ResolvedLanAccount,
+  sender: string,
+  event: TransportEvent,
+  payload: OutboundReplyPayload,
+): Promise<void> {
+  await deliverFormattedTextWithAttachments({
+    payload,
+    send: async ({ text }) => {
+      await sendTransportText(account, {
+        to: sender,
+        text,
+        conversationId: event.message.conversation_id ?? sender,
+        metadata: {
+          reply_to: event.message.id,
+        },
+      });
+    },
+  });
+}
+
+function registerShutdown(api: OpenClawPluginApi, abort: AbortController): void {
+  api.lifecycle.registerRuntimeLifecycle({
+    id: `${CHANNEL_ID}.inbound-bridge`,
+    description: "Stop the p2p-ddns LAN inbound bridge.",
+    cleanup: () => abort.abort(),
+  });
+}

@@ -63,6 +63,12 @@ pub enum ClientCommandArgs {
     /// List all network nodes
     List,
 
+    /// Resolve one daemon node by domain, full ID, or ID prefix
+    Resolve {
+        /// Domain, full node ID, or node ID prefix to resolve
+        id_or_domain: String,
+    },
+
     /// Get daemon status
     Status,
 
@@ -456,6 +462,7 @@ fn parse_http_response(resp: &[u8]) -> Result<(u16, Vec<u8>)> {
 fn to_client_command(command: ClientCommandArgs) -> ClientCommand {
     match command {
         ClientCommandArgs::List => ClientCommand::Query,
+        ClientCommandArgs::Resolve { id_or_domain } => ClientCommand::ResolveNode { id_or_domain },
         ClientCommandArgs::Status => ClientCommand::Status,
         ClientCommandArgs::Node {
             command: NodeCommand::Add { ticket },
@@ -477,6 +484,13 @@ fn display_response(response: ClientResponse, json: bool) -> Result<()> {
                 output::display_nodes_json(&nodes);
             } else {
                 output::display_nodes(&nodes);
+            }
+        }
+        ClientResponse::Node(node) => {
+            if json {
+                output::display_node_json(node.as_ref());
+            } else {
+                output::display_node(node.as_ref());
             }
         }
         ClientResponse::Status(status) => {

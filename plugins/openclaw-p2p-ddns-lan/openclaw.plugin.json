@@ -1,0 +1,80 @@
+{
+  "id": "p2p-ddns-lan",
+  "name": "p2p-ddns LAN",
+  "kind": "channel",
+  "description": "OpenClaw channel backed by p2p-ddns discovery and direct LAN transport.",
+  "activation": {
+    "onStartup": true
+  },
+  "channels": [
+    "p2p-ddns-lan"
+  ],
+  "channelEnvVars": {
+    "p2p-ddns-lan": [
+      "P2P_DDNS_AGENT_TRANSPORT_URL",
+      "P2P_DDNS_AGENT_SECRET"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "p2p-ddns-lan": {
+      "label": "p2p-ddns LAN",
+      "description": "Direct LAN agent messaging through p2p-ddns discovery.",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "transportUrl": {
+            "type": "string",
+            "description": "Local p2p-ddns-agent-transport base URL.",
+            "default": "http://127.0.0.1:39091"
+          },
+          "sharedSecret": {
+            "type": "string",
+            "description": "Optional shared secret for the transport HTTP API."
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                }
+              ]
+            },
+            "description": "Allowed remote p2p-ddns LAN sender ids."
+          },
+          "dmPolicy": {
+            "default": "allowlist",
+            "type": "string",
+            "enum": [
+              "pairing",
+              "allowlist",
+              "open",
+              "disabled"
+            ],
+            "description": "OpenClaw DM security policy for inbound LAN messages."
+          },
+          "dmSecurity": {
+            "type": "string",
+            "description": "Deprecated alias for dmPolicy."
+          }
+        }
+      }
+    }
+  }
+}

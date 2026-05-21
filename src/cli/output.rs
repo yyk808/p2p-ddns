@@ -310,6 +310,22 @@ pub fn display_nodes(nodes: &[Node]) {
     println!("{}", table);
 }
 
+pub fn display_node(node: Option<&Node>) {
+    match node {
+        Some(node) => display_nodes(std::slice::from_ref(node)),
+        None => {
+            println!(
+                "\n{}",
+                colorize(
+                    "No matching daemon node found.",
+                    Some(Color::DarkGrey),
+                    false
+                )
+            );
+        }
+    }
+}
+
 pub fn display_status(status: &DaemonStatus) {
     let left = status_section(
         "Daemon Status",
@@ -511,6 +527,11 @@ fn node_to_json(node: &Node) -> serde_json::Value {
 pub fn display_nodes_json(nodes: &[Node]) {
     let nodes_json: Vec<serde_json::Value> = nodes.iter().map(node_to_json).collect();
     let output = json!({ "nodes": nodes_json, "count": nodes.len() });
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+pub fn display_node_json(node: Option<&Node>) {
+    let output = json!({ "node": node.map(node_to_json) });
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
 }
 
