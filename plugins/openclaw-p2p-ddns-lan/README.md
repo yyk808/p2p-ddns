@@ -29,7 +29,7 @@ p2p-ddns-agent-transport \
     "p2p-ddns-lan": {
       "transportUrl": "http://127.0.0.1:39091",
       "allowFrom": ["agent-b"],
-      "dmSecurity": "allowlist"
+      "dmPolicy": "allowlist"
     }
   }
 }
@@ -39,6 +39,25 @@ Outbound messages use the OpenClaw shared `message` tool through this channel.
 The target is a p2p-ddns node domain or node id prefix.
 
 Inbound transport events are read from `GET /events`. The bridge calls a
-runtime receive hook when the installed OpenClaw version exposes one; otherwise
-it logs the received message so the dispatch adapter can be wired to that exact
-runtime surface.
+standard OpenClaw direct-DM runtime helper and reconnects with backoff if the
+transport is not available yet or the event stream closes.
+
+## Smoke Tests
+
+Verify outbound delivery through OpenClaw:
+
+```bash
+openclaw message send \
+  --channel p2p-ddns-lan \
+  --target <node-id-or-domain> \
+  --message "hello"
+```
+
+Verify inbound handling with an isolated OpenClaw profile and fake transport:
+
+```bash
+node scripts/openclaw-inbound-smoke.mjs
+```
+
+The inbound smoke starts the OpenClaw Gateway before the fake transport, so it
+also verifies that the `/events` bridge reconnects after startup ordering races.

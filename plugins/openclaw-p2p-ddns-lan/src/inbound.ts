@@ -10,6 +10,9 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { sendTransportText, subscribeTransportEvents, type TransportEvent } from "./client.js";
 import { CHANNEL_ID, resolveLanAccount, type ResolvedLanAccount } from "./config.js";
 
+const INITIAL_RECONNECT_DELAY_MS = 1000;
+const MAX_RECONNECT_DELAY_MS = 30_000;
+
 export async function startLanInboundBridge(
   api: OpenClawPluginApi,
 ): Promise<void> {
@@ -18,19 +21,37 @@ export async function startLanInboundBridge(
   const abort = new AbortController();
   registerShutdown(api, abort);
 
-  await subscribeTransportEvents(
-    account,
-    async (event) => {
-      if (!isAllowedSender(account, event.message.from)) {
-        api.runtime?.log?.warn?.(
-          `[${CHANNEL_ID}] dropped message from disallowed sender ${event.message.from}`,
-        );
+  let delayMs = INITIAL_RECONNECT_DELAY_MS;
+  while (!abort.signal.aborted) {
+    try {
+      await subscribeTransportEvents(
+        account,
+        async (event) => {
+          if (!isAllowedSender(account, event.message.from)) {
+            api.logger.warn(
+              `[${CHANNEL_ID}] dropped message from disallowed sender ${event.message.from}`,
+            );
+            return;
+          }
+          await dispatchInboundEvent(api, account, event);
+        },
+        abort.signal,
+      );
+      delayMs = INITIAL_RECONNECT_DELAY_MS;
+      if (!abort.signal.aborted) {
+        api.logger.warn(`[${CHANNEL_ID}] event stream closed; reconnecting`);
+      }
+    } catch (error) {
+      if (abort.signal.aborted || isAbortError(error)) {
         return;
       }
-      await dispatchInboundEvent(api, account, event);
-    },
-    abort.signal,
-  );
+      api.logger.warn(
+        `[${CHANNEL_ID}] event stream failed: ${String(error)}; reconnecting in ${delayMs}ms`,
+      );
+    }
+    await sleep(delayMs, abort.signal);
+    delayMs = Math.min(delayMs * 2, MAX_RECONNECT_DELAY_MS);
+  }
 }
 
 async function dispatchInboundEvent(
@@ -112,4 +133,25 @@ function registerShutdown(api: OpenClawPluginApi, abort: AbortController): void 
     description: "Stop the p2p-ddns LAN inbound bridge.",
     cleanup: () => abort.abort(),
   });
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }

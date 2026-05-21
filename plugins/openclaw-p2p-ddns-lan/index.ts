@@ -28,7 +28,7 @@ export default defineChannelPluginEntry({
   },
   registerFull(api) {
     startLanInboundBridge(api).catch((error) => {
-      api.runtime?.log?.warn?.(
+      api.logger.warn(
         `[p2p-ddns-lan] inbound bridge stopped: ${String(error)}`,
       );
     });
