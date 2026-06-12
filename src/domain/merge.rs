@@ -40,6 +40,14 @@ pub fn merge_node(existing: Option<&Node>, incoming: &Node) -> (Node, bool) {
         None => (incoming.clone(), true),
         Some(existing) => {
             let should_take_incoming = incoming.last_heartbeat > existing.last_heartbeat;
+            let services = if should_take_incoming
+                || (incoming.last_heartbeat == existing.last_heartbeat
+                    && !incoming.services.is_empty())
+            {
+                incoming.services.clone()
+            } else {
+                existing.services.clone()
+            };
             let addr = if should_take_incoming && has_ip_addr(&incoming.addr) {
                 incoming.addr.clone()
             } else {
@@ -49,11 +57,13 @@ pub fn merge_node(existing: Option<&Node>, incoming: &Node) -> (Node, bool) {
             let merged = if should_take_incoming {
                 Node {
                     addr,
+                    services,
                     ..incoming.clone()
                 }
             } else {
                 Node {
                     addr,
+                    services,
                     ..existing.clone()
                 }
             };
@@ -189,6 +199,24 @@ mod tests {
             "newer DHCP address update should replace the old IP instead of keeping it"
         );
         assert!(ips.contains(&new_ip));
+    }
+
+    #[test]
+    fn merge_node_accepts_same_second_service_update() {
+        let mut rng = rand::rng();
+        let pk = SecretKey::generate(&mut rng).public();
+
+        let mut existing = node_with_addr(EndpointAddr::new(pk), 100);
+        existing.node_id = pk;
+
+        let mut incoming = existing.clone();
+        incoming
+            .services
+            .insert("openclaw-agent".to_string(), 39092);
+
+        let (merged, _) = merge_node(Some(&existing), &incoming);
+
+        assert_eq!(merged.services.get("openclaw-agent"), Some(&39092));
     }
 
     #[test]

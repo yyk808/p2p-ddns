@@ -27,6 +27,9 @@ export default defineChannelPluginEntry({
     );
   },
   registerFull(api) {
+    if (!shouldStartInboundBridge(api)) {
+      return;
+    }
     startLanInboundBridge(api).catch((error) => {
       api.logger.warn(
         `[p2p-ddns-lan] inbound bridge stopped: ${String(error)}`,
@@ -34,3 +37,15 @@ export default defineChannelPluginEntry({
     });
   },
 });
+
+export function shouldStartInboundBridge(api, argv = process.argv) {
+  return api.registrationMode === "full" && isGatewayRuntimeCommand(argv);
+}
+
+function isGatewayRuntimeCommand(argv) {
+  const gatewayIndex = argv.indexOf("gateway");
+  if (gatewayIndex < 0) return false;
+
+  const nextArg = argv[gatewayIndex + 1];
+  return nextArg == null || nextArg === "run" || nextArg.startsWith("-");
+}

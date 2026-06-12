@@ -131,6 +131,7 @@ pub fn required_permission(cmd: &ClientCommand) -> &'static str {
         ClientCommand::ResolveNode { .. } => "query",
         ClientCommand::AddNode { .. } => "add_node",
         ClientCommand::RemoveNode { .. } => "remove_node",
+        ClientCommand::SetService { .. } => "control",
         ClientCommand::Status => "query",
         ClientCommand::GetTicket => "query",
         ClientCommand::Pause => "control",
@@ -326,6 +327,19 @@ pub async fn handle_command(
             };
             CommandOutcome {
                 response: ClientResponse::Ack(msg),
+                action: None,
+            }
+        }
+        ClientCommand::SetService { name, port } => {
+            ctx.local_services.write().insert(name.clone(), *port);
+            ctx.broadcast_state_update().await;
+            ctx.send_state_update_to_known_nodes().await;
+            ctx.request_neighbor_sync().await;
+            CommandOutcome {
+                response: ClientResponse::Ack(format!(
+                    "Service '{}' registered on port {}",
+                    name, port
+                )),
                 action: None,
             }
         }

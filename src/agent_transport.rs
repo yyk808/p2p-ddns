@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
         Arc,
@@ -73,6 +73,31 @@ impl AdminClient {
         }
     }
 
+    pub async fn query_nodes(&self) -> Result<Vec<Node>> {
+        match self.execute(ClientCommand::Query).await? {
+            ClientResponse::Nodes(nodes) => Ok(nodes),
+            ClientResponse::Error(e) => anyhow::bail!(e),
+            other => anyhow::bail!("unexpected admin response: {other:?}"),
+        }
+    }
+
+    pub async fn set_service(&self, name: &str, port: u16) -> Result<()> {
+        match self
+            .execute(ClientCommand::SetService {
+                name: name.to_string(),
+                port: port as u32,
+            })
+            .await?
+        {
+            ClientResponse::Ack(msg) => {
+                info!("Admin set_service: {}", msg);
+                Ok(())
+            }
+            ClientResponse::Error(e) => anyhow::bail!(e),
+            other => anyhow::bail!("unexpected admin response: {other:?}"),
+        }
+    }
+
     async fn execute(&self, command: ClientCommand) -> Result<ClientResponse> {
         match &self.endpoint {
             AdminEndpoint::UnixSocket(path) => {
@@ -132,6 +157,19 @@ pub struct TransportEvent {
     pub received_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Contact {
+    pub id: String,
+    pub node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<SocketAddr>,
+    pub sendable: bool,
+}
+
 #[derive(Clone)]
 struct TransportState {
     config: Arc<TransportConfig>,
@@ -148,6 +186,18 @@ pub async fn run_transport(config: TransportConfig) -> Result<()> {
         next_id: Arc::new(AtomicU64::new(1)),
     };
 
+    if let Err(e) = state
+        .config
+        .admin
+        .set_service("openclaw-agent", state.config.advertise_port)
+        .await
+    {
+        warn!(
+            "Failed to register service with p2p-ddns: {}. Service discovery may use fallback port.",
+            e
+        );
+    }
+
     info!("Agent transport listening on http://{}", state.config.bind);
     loop {
         let (mut stream, peer) = listener.accept().await?;
@@ -161,14 +211,67 @@ pub async fn run_transport(config: TransportConfig) -> Result<()> {
 }
 
 pub fn transport_addr_for_node(node: &Node, port: u16) -> Option<SocketAddr> {
+    let effective_port: u16 = node
+        .services
+        .get("openclaw-agent")
+        .and_then(|&p| p.try_into().ok())
+        .unwrap_or(port);
     let mut first = None;
+    let mut first_ipv4_loopback = None;
     for candidate in node.addr.ip_addrs() {
         first.get_or_insert(*candidate);
+        if candidate.ip().is_loopback() && candidate.ip().is_ipv4() {
+            first_ipv4_loopback.get_or_insert(*candidate);
+        }
         if !candidate.ip().is_loopback() {
-            return Some(SocketAddr::new(candidate.ip(), port));
+            return Some(SocketAddr::new(candidate.ip(), effective_port));
         }
     }
-    first.map(|addr| SocketAddr::new(addr.ip(), port))
+    if let Some(addr) = first_ipv4_loopback {
+        return Some(SocketAddr::new(addr.ip(), effective_port));
+    }
+    if first.is_some_and(|addr| addr.ip().is_loopback()) {
+        return Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            effective_port,
+        ));
+    }
+    first.map(|addr| SocketAddr::new(addr.ip(), effective_port))
+}
+
+pub fn transport_addr_for_node_with_local_ips(
+    node: &Node,
+    port: u16,
+    local_ips: impl IntoIterator<Item = IpAddr>,
+) -> Option<SocketAddr> {
+    let locals: Vec<IpAddr> = local_ips.into_iter().collect();
+    let mut best: Option<(u32, SocketAddr)> = None;
+    for candidate in node.addr.ip_addrs() {
+        let score = best_prefix_score(candidate.ip(), &locals);
+        if best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((score, SocketAddr::new(candidate.ip(), port)));
+        }
+    }
+    best.map(|(_, addr)| addr)
+}
+
+fn best_prefix_score(candidate: IpAddr, locals: &[IpAddr]) -> u32 {
+    let mut best = 0u32;
+    for local in locals {
+        let score = common_prefix_len(candidate, *local);
+        if score > best {
+            best = score;
+        }
+    }
+    best
+}
+
+fn common_prefix_len(a: IpAddr, b: IpAddr) -> u32 {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => (u32::from(a) ^ u32::from(b)).leading_zeros(),
+        (IpAddr::V6(a), IpAddr::V6(b)) => (u128::from(a) ^ u128::from(b)).leading_zeros(),
+        _ => 0,
+    }
 }
 
 async fn handle_connection(
@@ -181,6 +284,17 @@ async fn handle_connection(
         ("GET", "/health") => {
             let body = serde_json::json!({ "ok": true });
             write_json_response(stream, 200, &body).await
+        }
+        ("GET", "/contacts") => {
+            if !can_send_from_peer(peer, &headers, state.config.shared_secret.as_deref()) {
+                let resp = SendResponse {
+                    ok: false,
+                    message_id: None,
+                    error: Some("Forbidden".to_string()),
+                };
+                return write_json_response(stream, 403, &resp).await;
+            }
+            handle_contacts(stream, state).await
         }
         ("GET", "/events") => handle_events(stream, state).await,
         ("POST", "/send") => {
@@ -207,6 +321,57 @@ async fn handle_connection(
         }
         _ => write_plain_response(stream, 404, b"Not Found").await,
     }
+}
+
+async fn handle_contacts(stream: &mut tokio::net::TcpStream, state: TransportState) -> Result<()> {
+    match state.config.admin.query_nodes().await {
+        Ok(nodes) => {
+            let contacts =
+                contacts_for_nodes(nodes, &state.config.local_id, state.config.advertise_port);
+            write_json_response(stream, 200, &contacts).await
+        }
+        Err(e) => {
+            let resp = SendResponse {
+                ok: false,
+                message_id: None,
+                error: Some(format!("Failed to query nodes: {e}")),
+            };
+            write_json_response(stream, 502, &resp).await
+        }
+    }
+}
+
+pub fn contacts_for_nodes(
+    nodes: impl IntoIterator<Item = Node>,
+    local_id: &str,
+    port: u16,
+) -> Vec<Contact> {
+    let mut contacts = nodes
+        .into_iter()
+        .filter_map(|node| contact_for_node(node, local_id, port))
+        .collect::<Vec<_>>();
+    contacts.sort_by(|a, b| a.id.cmp(&b.id));
+    contacts
+}
+
+fn contact_for_node(node: Node, local_id: &str, port: u16) -> Option<Contact> {
+    let node_id = node.node_id.to_string();
+    let domain = node.domain.trim();
+    let domain = (!domain.is_empty()).then(|| domain.to_string());
+    let id = domain.clone().unwrap_or_else(|| node_id.clone());
+    if id == local_id || node_id == local_id || domain.as_deref() == Some(local_id) {
+        return None;
+    }
+    let addr = transport_addr_for_node(&node, port);
+    let sendable = addr.is_some_and(|addr| !util::is_local_only_ip(addr.ip()));
+    sendable.then(|| Contact {
+        id,
+        node_id,
+        name: domain.clone(),
+        domain,
+        addr,
+        sendable,
+    })
 }
 
 fn can_send_from_peer(
@@ -251,7 +416,15 @@ async fn handle_send(
     }
 
     let node = match state.config.admin.resolve_node(&req.to).await {
-        Ok(Some(node)) => node,
+        Ok(Some(node)) => {
+            log::debug!(
+                "Resolved '{}' -> services={:?}, addrs={:?}",
+                req.to,
+                node.services,
+                node.addr.ip_addrs().collect::<Vec<_>>()
+            );
+            node
+        }
         Ok(None) => {
             let resp = SendResponse {
                 ok: false,
@@ -514,6 +687,32 @@ async fn send_json_post<T: Serialize>(
     parse_http_response(&resp)
 }
 
+#[cfg(test)]
+async fn send_http_get(
+    bind: SocketAddr,
+    path: &str,
+    shared_secret: Option<&str>,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>)> {
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(bind))
+        .await
+        .map_err(|_| anyhow::anyhow!("failed to connect to {bind}"))??;
+
+    let secret_header = shared_secret
+        .map(|secret| format!("{SECRET_HEADER}: {secret}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n",
+        host_header(bind),
+        secret_header,
+    );
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await?;
+    parse_http_response(&resp)
+}
+
 fn parse_http_response(resp: &[u8]) -> Result<(u16, Vec<u8>)> {
     let header_end = resp
         .windows(4)
@@ -677,6 +876,52 @@ mod tests {
     }
 
     #[test]
+    fn transport_addr_uses_advertised_openclaw_service_port() {
+        let mut rng = rand::rng();
+        let pk = SecretKey::generate(&mut rng).public();
+        let p2p_addr: SocketAddr = "192.168.1.20:7777".parse().unwrap();
+        let mut services = BTreeMap::new();
+        services.insert("openclaw-agent".to_string(), 39092);
+        let node = Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::from_parts(pk, [TransportAddr::Ip(p2p_addr)]),
+            domain: "agent-b".to_string(),
+            services,
+            last_heartbeat: 1,
+        };
+
+        assert_eq!(
+            transport_addr_for_node(&node, 39091),
+            Some("192.168.1.20:39092".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn transport_addr_prefers_candidate_nearest_local_ip() {
+        let mut rng = rand::rng();
+        let pk = SecretKey::generate(&mut rng).public();
+        let remote_a: SocketAddr = "10.10.0.5:7777".parse().unwrap();
+        let remote_b: SocketAddr = "192.168.1.20:7777".parse().unwrap();
+        let node = Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::from_parts(
+                pk,
+                [TransportAddr::Ip(remote_a), TransportAddr::Ip(remote_b)],
+            ),
+            domain: "agent-b".to_string(),
+            services: BTreeMap::new(),
+            last_heartbeat: 1,
+        };
+
+        assert_eq!(
+            transport_addr_for_node_with_local_ips(&node, 39091, ["192.168.1.2".parse().unwrap()]),
+            Some("192.168.1.20:39091".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn transport_addr_skips_loopback_when_lan_ip_exists() {
         let mut rng = rand::rng();
         let pk = SecretKey::generate(&mut rng).public();
@@ -697,6 +942,53 @@ mod tests {
         assert_eq!(
             transport_addr_for_node(&node, 39091),
             Some("10.1.2.3:39091".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn transport_addr_prefers_ipv4_when_only_loopback_candidates_exist() {
+        let mut rng = rand::rng();
+        let pk = SecretKey::generate(&mut rng).public();
+        let loopback_v6: SocketAddr = "[::1]:7777".parse().unwrap();
+        let loopback_v4: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let node = Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::from_parts(
+                pk,
+                [
+                    TransportAddr::Ip(loopback_v6),
+                    TransportAddr::Ip(loopback_v4),
+                ],
+            ),
+            domain: "agent-b".to_string(),
+            services: BTreeMap::new(),
+            last_heartbeat: 1,
+        };
+
+        assert_eq!(
+            transport_addr_for_node(&node, 39091),
+            Some("127.0.0.1:39091".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn transport_addr_normalizes_ipv6_loopback_to_ipv4_loopback() {
+        let mut rng = rand::rng();
+        let pk = SecretKey::generate(&mut rng).public();
+        let loopback_v6: SocketAddr = "[::1]:7777".parse().unwrap();
+        let node = Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::from_parts(pk, [TransportAddr::Ip(loopback_v6)]),
+            domain: "agent-b".to_string(),
+            services: BTreeMap::new(),
+            last_heartbeat: 1,
+        };
+
+        assert_eq!(
+            transport_addr_for_node(&node, 39091),
+            Some("127.0.0.1:39091".parse().unwrap())
         );
     }
 
@@ -786,6 +1078,56 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn contacts_query_admin_nodes_and_return_sendable_peers() -> Result<()> {
+        let mut rng = rand::rng();
+        let self_pk = SecretKey::generate(&mut rng).public();
+        let peer_pk = SecretKey::generate(&mut rng).public();
+        let local_only_pk = SecretKey::generate(&mut rng).public();
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let admin_addr = admin_listener.local_addr()?;
+        tokio::spawn(async move {
+            let (mut stream, _) = admin_listener.accept().await.unwrap();
+            let (_method, path, _headers, body) = read_http_request(&mut stream).await.unwrap();
+            assert_eq!(path, "/command");
+            let req: AdminCommandRequest = postcard::from_bytes(&body).unwrap();
+            assert!(matches!(req.command, ClientCommand::Query));
+
+            let self_node = test_node(self_pk, "agent-a", "10.1.0.1:7777");
+            let peer_node = test_node(peer_pk, "agent-b", "10.1.0.2:7777");
+            let local_only_node = test_node(local_only_pk, "agent-local", "127.0.0.1:7777");
+            let resp = ClientResponse::Nodes(vec![self_node, peer_node, local_only_node]);
+            let body = postcard::to_stdvec(&resp).unwrap();
+            write_response(&mut stream, 200, "application/postcard", &body)
+                .await
+                .unwrap();
+        });
+
+        let contacts_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let contacts_addr = contacts_listener.local_addr()?;
+        let contacts_state = test_state("agent-a", 39091, Some(admin_addr));
+        tokio::spawn(async move {
+            let (mut stream, peer) = contacts_listener.accept().await.unwrap();
+            handle_connection(&mut stream, peer, contacts_state)
+                .await
+                .unwrap();
+        });
+
+        let (status, body) =
+            send_http_get(contacts_addr, "/contacts", None, Duration::from_secs(5)).await?;
+        assert_eq!(status, 200);
+        let contacts: Vec<Contact> = serde_json::from_slice(&body)?;
+
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].id, "agent-b");
+        assert_eq!(contacts[0].domain.as_deref(), Some("agent-b"));
+        assert_eq!(contacts[0].addr, Some("10.1.0.2:39091".parse().unwrap()));
+        assert!(contacts[0].sendable);
+
+        Ok(())
+    }
+
     fn test_state(
         local_id: &str,
         advertise_port: u16,
@@ -805,6 +1147,18 @@ mod tests {
             }),
             events,
             next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn test_node(pk: iroh::PublicKey, domain: &str, addr: &str) -> Node {
+        let p2p_addr: SocketAddr = addr.parse().unwrap();
+        Node {
+            node_id: pk,
+            invitor: pk,
+            addr: EndpointAddr::from_parts(pk, [TransportAddr::Ip(p2p_addr)]),
+            domain: domain.to_string(),
+            services: BTreeMap::new(),
+            last_heartbeat: 1,
         }
     }
 }

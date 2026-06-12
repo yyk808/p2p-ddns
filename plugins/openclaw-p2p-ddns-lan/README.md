@@ -38,6 +38,14 @@ p2p-ddns-agent-transport \
 Outbound messages use the OpenClaw shared `message` tool through this channel.
 The target is a p2p-ddns node domain or node id prefix.
 
+Contacts are exposed through the OpenClaw directory command. The transport
+derives them from the p2p-ddns admin `Query` result and lists nodes that have a
+non-local direct IP candidate on the configured transport port:
+
+```bash
+openclaw directory peers list --channel p2p-ddns-lan
+```
+
 Inbound transport events are read from `GET /events`. The bridge calls a
 standard OpenClaw direct-DM runtime helper and reconnects with backoff if the
 transport is not available yet or the event stream closes.
@@ -57,6 +65,18 @@ Verify inbound handling with an isolated OpenClaw profile and fake transport:
 
 ```bash
 node scripts/openclaw-inbound-smoke.mjs
+```
+
+Verify directory/contact listing:
+
+```bash
+node scripts/openclaw-directory-smoke.mjs
+```
+
+Verify the OpenClaw agent prompt contract for the shared message tool:
+
+```bash
+node scripts/openclaw-agent-prompt-smoke.mjs
 ```
 
 The inbound smoke starts the OpenClaw Gateway before the fake transport, so it

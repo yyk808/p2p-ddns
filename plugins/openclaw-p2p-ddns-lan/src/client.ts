@@ -19,6 +19,15 @@ export type TransportEvent = {
   received_at: number;
 };
 
+export type TransportContact = {
+  id: string;
+  node_id: string;
+  domain?: string;
+  name?: string;
+  addr?: string;
+  sendable: boolean;
+};
+
 export async function sendTransportText(
   account: ResolvedLanAccount,
   params: {
@@ -82,6 +91,34 @@ export async function subscribeTransportEvents(
       await onEvent(JSON.parse(data) as TransportEvent);
     }
   }
+}
+
+export async function listTransportContacts(
+  account: ResolvedLanAccount,
+): Promise<TransportContact[]> {
+  const response = await fetch(`${account.transportUrl}/contacts`, {
+    headers: transportHeaders(account),
+  });
+  const result = (await response.json()) as TransportContact[] | { error?: string };
+  if (!response.ok) {
+    throw new Error(
+      readTransportError(result) ||
+        `p2p-ddns-lan contacts returned HTTP ${response.status}`,
+    );
+  }
+  if (!Array.isArray(result)) {
+    throw new Error("p2p-ddns-lan contacts returned invalid JSON");
+  }
+  return result;
+}
+
+function readTransportError(value: unknown): string | undefined {
+  return value &&
+    typeof value === "object" &&
+    "error" in value &&
+    typeof value.error === "string"
+    ? value.error
+    : undefined;
 }
 
 function transportHeaders(account: ResolvedLanAccount): Record<string, string> {

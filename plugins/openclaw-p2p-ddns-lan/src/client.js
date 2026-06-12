@@ -50,6 +50,23 @@ export async function subscribeTransportEvents(account, onEvent, signal) {
   }
 }
 
+export async function listTransportContacts(account) {
+  const response = await fetch(`${account.transportUrl}/contacts`, {
+    headers: transportHeaders(account),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(
+      result.error ??
+        `p2p-ddns-lan contacts returned HTTP ${response.status}`,
+    );
+  }
+  if (!Array.isArray(result)) {
+    throw new Error("p2p-ddns-lan contacts returned invalid JSON");
+  }
+  return result;
+}
+
 function transportHeaders(account) {
   const headers = {
     "content-type": "application/json",

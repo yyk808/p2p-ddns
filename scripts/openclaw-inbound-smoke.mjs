@@ -16,6 +16,7 @@ let transport;
 let eventsResponse;
 let sawEventsConnection = false;
 let sawSend = false;
+let sendBodies = [];
 let gatewayOutput = "";
 const transportSockets = new Set();
 
@@ -66,6 +67,13 @@ try {
     10_000,
     "OpenClaw did not send a reply through the p2p-ddns transport",
   );
+  if (!sendBodies.some((body) => body.to === "peer-b")) {
+    throw new Error(
+      `OpenClaw reply was not addressed to inbound sender peer-b: ${JSON.stringify(
+        sendBodies,
+      )}`,
+    );
+  }
 
   console.log(
     JSON.stringify(
@@ -164,8 +172,13 @@ function startFakeTransport(port) {
     }
 
     if (req.method === "POST" && req.url === "/send") {
+      const rawBody = await readRequestBody(req);
+      try {
+        sendBodies.push(JSON.parse(rawBody || "{}"));
+      } catch {
+        sendBodies.push({ parseError: rawBody });
+      }
       sawSend = true;
-      await readRequestBody(req);
       writeJson(res, 200, { ok: true, message_id: "smoke-reply-1" });
       return;
     }

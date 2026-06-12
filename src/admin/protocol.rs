@@ -24,6 +24,7 @@ pub enum ClientCommand {
     ResolveNode { id_or_domain: String },
     AddNode { ticket: String },
     RemoveNode { id: String },
+    SetService { name: String, port: u32 },
     Status,
     GetTicket,
     Pause,

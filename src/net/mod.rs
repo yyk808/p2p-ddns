@@ -1,6 +1,7 @@
 pub mod p2p_protocol;
 
 use std::{
+    collections::BTreeMap,
     io::IsTerminal,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::PathBuf,
@@ -64,6 +65,7 @@ pub struct Context {
     pub nodes: DashMap<EndpointId, Node>,
     trusted_nodes: DashMap<EndpointId, Node>,
     pub me: Arc<Node>,
+    pub local_services: Arc<RwLock<BTreeMap<String, u32>>>,
     pub sender: GossipSender,
     pub args: DaemonArgs,
     started_at: u64,
@@ -517,6 +519,7 @@ fallback attempts: {:#?}",
         nodes: bootstrap_nodes,
         trusted_nodes,
         me: Arc::new(me),
+        local_services: Arc::new(RwLock::new(BTreeMap::new())),
         sender,
         args,
         started_at: time_now(),
@@ -724,7 +727,7 @@ impl Context {
             rnum: self.ticket.rnum(),
             addr: me.addr,
             alias: me.domain,
-            services: me.services,
+            services: self.local_services.read().clone(),
             invitor: me.invitor,
         };
 
@@ -955,6 +958,10 @@ impl Context {
         let mut me = (*self.me).clone();
         me.addr = advertised_endpoint_addr(&self.handle.addr(), &self.args);
         me.last_heartbeat = time_now();
+        me.services = self.local_services.read().clone();
+        if !me.services.is_empty() {
+            log::debug!("Broadcasting with services: {:?}", me.services);
+        }
         me
     }
 
@@ -968,6 +975,28 @@ impl Context {
                 invitor: me.invitor,
             })
             .await;
+    }
+
+    pub async fn send_state_update_to_known_nodes(&self) {
+        let me = self.current_node_state();
+        let message = Message::AboutMe {
+            addr: me.addr,
+            alias: me.domain,
+            services: me.services,
+            invitor: me.invitor,
+        };
+        let node_ids = self
+            .nodes
+            .iter()
+            .filter(|node| is_daemon_node(node.value()))
+            .map(|node| *node.key())
+            .collect::<Vec<_>>();
+
+        for node_id in node_ids {
+            if let Err(e) = self.send_message_to(&node_id, message.clone()).await {
+                log::warn!("Failed to send state update to {node_id:?}: {e}");
+            }
+        }
     }
 
     pub async fn request_neighbor_sync(&self) {

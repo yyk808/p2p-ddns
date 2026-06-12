@@ -71,7 +71,7 @@ async function dispatchInboundEvent(api, account, event) {
     provider: CHANNEL_ID,
     surface: CHANNEL_ID,
     originatingChannel: CHANNEL_ID,
-    originatingTo: account.accountId ?? CHANNEL_ID,
+    originatingTo: sender,
     extraContext: {
       PeerAddr: event.peer_addr,
       ReceivedAt: event.received_at,
